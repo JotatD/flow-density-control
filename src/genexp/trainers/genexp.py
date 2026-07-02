@@ -1,42 +1,15 @@
 from omegaconf import DictConfig
 from diffusiongym.base_models import BaseModel
 from diffusiongym.environments import Environment
-from diffusiongym.types import D
 from genexp.constraints import Constraint
 from genexp.trainers.adjoint_matching import AMTrainerFlow
 from genexp.trainers.ddpo import DDPOTrainer
+from genexp.trainers.utils import _score_func
 from typing import Optional
 from tqdm import tqdm
 
 import torch
 import copy
-
-
-def _score_func(model: BaseModel[D], latent: D, t: torch.Tensor) -> D:
-    """Compute the score function ∇log p_t(x) from a velocity-predicting model."""
-    if model.output_type == "score":
-        return model.forward(latent, t)
-
-    elif model.output_type == "velocity":
-        v = model.forward(latent, t)
-        scheduler = model.scheduler
-        kappa = scheduler.kappa(latent, t)
-        eta = scheduler.eta(latent, t)
-        return (v - kappa * latent) / eta
-
-    elif model.output_type == "endpoint":
-        x_1 = model.forward(latent, t)
-        scheduler = model.scheduler
-        alpha = scheduler.alpha(latent, t)
-        beta = scheduler.beta(latent, t)
-        return (alpha * x_1 - latent) / (beta**2)
-
-    elif model.output_type == "epsilon":
-        eps = model.forward(latent, t)
-        beta = model.scheduler.beta(latent, t)
-        return -eps / beta
-
-    raise ValueError("Incorrectly specified base model")
 
 
 class FlowExpansionTrainer:
