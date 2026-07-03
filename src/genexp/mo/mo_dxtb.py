@@ -1,7 +1,5 @@
 """DXTB endpoint molecule rewards."""
 
-from contextlib import redirect_stdout
-import os
 from typing import Any, Callable, Sequence
 
 import dgl
@@ -95,9 +93,8 @@ class _DXTBReward(MOReward[DDGraph]):
 
     @staticmethod
     def _silent_dxtb_call(fn: Callable[..., torch.Tensor], *args: Any, **kwargs: Any) -> torch.Tensor:
-        with open(os.devnull, "w") as devnull:
-            with redirect_stdout(devnull):
-                return fn(*args, **kwargs)
+        with dxtb.OutputHandler.with_verbosity(0):
+            return fn(*args, **kwargs)
 
 
 class DXTBEnergy(_DXTBReward):
