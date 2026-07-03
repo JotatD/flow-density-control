@@ -73,7 +73,7 @@ def main():
         for adjoint_iteration in range(config.adjoint_matching.num_iterations):
             global_step += 1
             am_dataset = trainer.generate_dataset()
-            loss = trainer.finetune(am_dataset, steps=config.adjoint_matching.finetune_steps)
+            loss = trainer.finetune(am_dataset, steps=None)
 
             problem_mean = evaluate_mean(trainer, num_samples=num_eval_samples)
             loss_text = "nan" if not isfinite(loss) else f"{loss:.6f}"
