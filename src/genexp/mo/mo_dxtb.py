@@ -45,9 +45,6 @@ class _DXTBReward(MOReward[DDGraph]):
         self.atom_type_map = tuple(atom_type_map)
 
     def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
-        sample.graph.ndata["x_1"]
-        sample.graph.ndata["a_1"]
-
         graphs = unbatch_dxtb_graphs(sample.graph)
         reward_shape = (len(sample),) if self.num_rew == 1 else (len(sample), self.num_rew)
         rewards = torch.full(reward_shape, self.invalid_val, dtype=torch.float32, device=sample.device)
@@ -71,17 +68,17 @@ class _DXTBReward(MOReward[DDGraph]):
         if graph.num_nodes() != self.fixed_num_atoms:
             raise ValueError(f"DXTBReward expects {self.fixed_num_atoms} atoms per molecule; got {graph.num_nodes()}")
 
-        atom_type_idx = graph.ndata["a_1"].argmax(dim=-1)
+        atom_type_idx = graph.ndata["a_t"].argmax(dim=-1)
         atom_type_idx = torch.where(atom_type_idx < len(self.atom_type_map), atom_type_idx, torch.zeros_like(atom_type_idx))
         atomic_numbers = torch.tensor([ATOMIC_NUMBERS[symbol] for symbol in self.atom_type_map], dtype=torch.long, device=graph.device)
         numbers = atomic_numbers[atom_type_idx.to(device=graph.device)]
 
-        positions = graph.ndata["x_1"].to(dtype=torch.double) * ANGSTROM_TO_BOHR
+        positions = graph.ndata["x_t"].to(dtype=torch.double) * ANGSTROM_TO_BOHR
 
-        if "c_1" not in graph.ndata:
+        if "c_t" not in graph.ndata:
             charge = torch.zeros((), dtype=torch.double, device=graph.device)
         else:
-            charge_idx = graph.ndata["c_1"].argmax(dim=-1)
+            charge_idx = graph.ndata["c_t"].argmax(dim=-1)
             atom_charges = charge_idx.clamp(max=GEOM_MAX_CHARGE_CLASS).to(dtype=torch.double)
             charge = (atom_charges + GEOM_CHARGE_OFFSET).sum()
 
@@ -98,10 +95,11 @@ class _DXTBReward(MOReward[DDGraph]):
 
 
 class DXTBEnergy(_DXTBReward):
-    """DXTB total energy reward."""
+    """Lower physical energies are better, so this returns ``-energy``"""
 
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
-        return self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500)
+        energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500)
+        return -energy
 
 
 class DXTBDipoleL2(_DXTBReward):
@@ -113,7 +111,7 @@ class DXTBDipoleL2(_DXTBReward):
 
 
 class DXTBTask(_DXTBReward):
-    """DXTB two-objective reward with energy and dipole L2 norm."""
+    """DXTB two-objective reward with negative energy and dipole L2 norm."""
     ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
     
     def __init__(self, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP) -> None:
@@ -122,4 +120,4 @@ class DXTBTask(_DXTBReward):
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
         dipole = self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
-        return torch.stack([energy, dipole])
+        return torch.stack([-energy, dipole])
