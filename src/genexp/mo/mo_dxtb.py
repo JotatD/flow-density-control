@@ -39,9 +39,10 @@ class _DXTBReward(MOReward[DDGraph]):
     """Base class for scalar endpoint molecule rewards computed with DXTB."""
 
     invalid_val = 0.0
+    ref_point = torch.tensor([0.0], dtype=torch.float32)
 
     def __init__(self, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP, num_rew: int = 1) -> None:
-        super().__init__(num_rew=num_rew)
+        super().__init__(num_rew=num_rew, ref_point=self.ref_point)
         self.fixed_num_atoms = fixed_num_atoms
         self.atom_type_map = tuple(atom_type_map)
 
@@ -116,9 +117,10 @@ class DXTBDipoleL2(_DXTBReward):
 
 class DXTBTask(_DXTBReward):
     """DXTB two-objective reward with energy and dipole L2 norm."""
-
+    ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
+    
     def __init__(self, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP) -> None:
-        super().__init__(fixed_num_atoms=fixed_num_atoms, atom_type_map=atom_type_map, num_rew=2)
+        super().__init__(fixed_num_atoms=fixed_num_atoms, atom_type_map=atom_type_map, num_rew=2, ref_point=self.ref_point)
 
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())

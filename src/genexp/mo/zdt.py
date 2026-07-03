@@ -11,6 +11,7 @@ from genexp.mo.base import MOReward
 
 class _ZDTTorch(MOReward[DDTensor]):
     default_input_dim = 30
+    ref_point = torch.tensor([-1.1, -10.1])
     valid_input_transforms = {"clamp", "sigmoid", "none"}
 
     def __init__(
@@ -19,7 +20,7 @@ class _ZDTTorch(MOReward[DDTensor]):
         input_transform: Literal["clamp", "sigmoid", "none"] = "clamp",
         eps: float = 1e-8,
     ):
-        super().__init__(num_rew=2)
+        super().__init__(num_rew=2, ref_point=self.ref_point)
         self.input_dim = self.default_input_dim if input_dim is None else input_dim
         self.input_transform = input_transform
         self.eps = eps
@@ -46,6 +47,7 @@ class ZDT1Torch(_ZDTTorch):
     """Continuous ZDT1 reward with negated objectives for maximization."""
 
     default_input_dim = 30
+    ref_point = torch.tensor([-1.1, -10.1])
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         f1 = x_unit[:, 0]
@@ -58,6 +60,7 @@ class ZDT2Torch(_ZDTTorch):
     """Continuous ZDT2 reward with negated objectives for maximization."""
 
     default_input_dim = 30
+    ref_point = torch.tensor([-1.1, -10.1])
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         f1 = x_unit[:, 0]
@@ -70,6 +73,7 @@ class ZDT3Torch(_ZDTTorch):
     """Continuous ZDT3 reward with disconnected Pareto front segments."""
 
     default_input_dim = 30
+    ref_point = torch.tensor([-1.1, -20.1])
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         f1 = x_unit[:, 0]
@@ -83,6 +87,7 @@ class ZDT4Torch(_ZDTTorch):
     """Continuous ZDT4 reward with negated objectives for maximization."""
 
     default_input_dim = 10
+    ref_point = torch.tensor([-1.1, -125.1])
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         f1 = x_unit[:, 0]
@@ -96,6 +101,7 @@ class ZDT6Torch(_ZDTTorch):
     """Continuous ZDT6 reward with negated objectives for maximization."""
 
     default_input_dim = 10
+    ref_point = torch.tensor([-1.1, -10.1])
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x1 = x_unit[:, 0]
