@@ -5,7 +5,7 @@ from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
 from diffusiongym.environments import EndpointEnvironment
-from diffusiongym.molecules.flowmol import FlowMolBaseModel
+from diffusiongym.molecules.flowmol import GEOMBaseModel
 
 from genexp.mo import DXTBDipoleL2, DXTBEnergy
 from genexp.trainers.rew_diff import RewDiff
@@ -24,7 +24,7 @@ def parse_args():
 
 
 def build_environment(config, reward, device):
-    base_model = FlowMolBaseModel(config.model_name, (1, 2, 2, 2), device)
+    base_model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(
         base_model,
         reward,
@@ -75,19 +75,19 @@ def main():
     trainer = RewDiff(config, env, device=device)
     num_eval_samples = int(config.get("num_eval_samples", 16))
     log = WandbLogger(
-        project_name="reward_dxtb",
+        project_name="large_vals_dxtb",
         config=build_wandb_config(args, config, config_idx),
         use_wandb=args.wandb,
-        run_name=f"{args.problem}_config{config_idx}",
+        run_name=f"{args.problem}_{config_idx}",
     )
     
     global_step = log.set_step_metric(0, "global_step")
     problem_mean = log.watch('problem_mean', 'global_step')
-    problem_mean.value = 0.1
+    problem_mean.val = evaluate_mean(trainer, num_samples=num_eval_samples)
     
     print(
         f"problem={args.problem} problem_eval=loaded num_samples={num_eval_samples} "
-        f"problem_mean={problem_mean:.6f}",
+        f"problem_mean={problem_mean.val:.6f}",
         flush=True,
     )
 
@@ -95,17 +95,15 @@ def main():
     for md_iteration in tqdm(range(config.num_md_iterations)):
         for adjoint_iteration in range(config.adjoint_matching.num_iterations):
             global_step += 1
-            # am_dataset = trainer.generate_dataset()
-            # loss = trainer.finetune(am_dataset, steps=None)
-            loss.value = adjoint_iteration + 3.5
+            am_dataset = trainer.generate_dataset()
+            loss.val = trainer.finetune(am_dataset, steps=None)
             
-            # problem_mean = evaluate_mean(trainer, num_samples=num_eval_samples)
-            problem_mean.value = 0.1 * (adjoint_iteration + 1)  # Simulate an increasing mean for demonstration
+            problem_mean.val = evaluate_mean(trainer, num_samples=num_eval_samples)
             
-            loss_text = "nan" if not isfinite(loss.value) else f"{loss.value:.6f}"
+            loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
             print(
                 f"md={md_iteration + 1} adjoint={adjoint_iteration + 1} "
-                f"loss={loss_text} problem_mean={problem_mean:.6f}",
+                f"loss={loss_text} problem_mean={problem_mean.val:.6f}",
                 flush=True,
             )
             if loss_text == "nan":

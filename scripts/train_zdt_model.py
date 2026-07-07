@@ -69,7 +69,7 @@ def train_flow(
     device: torch.device,
     batch_size: int = 128,
     max_epochs: int = 10,
-) -> Path:
+):
     input_dim = train_data.shape[1]
     model = TensorMLPModel(
         OptimalTransportScheduler(),
@@ -90,7 +90,7 @@ def train_diffusion(
     max_epochs: int = 10,
     beta_0: float = 0.1,
     beta_1: float = 12.0,
-) -> Path:
+):
     input_dim = train_data.shape[1]
     n_steps = 1000
     betas = torch.linspace(beta_0 / n_steps, beta_1 / n_steps, n_steps, device=device)
@@ -103,6 +103,7 @@ def train_diffusion(
     ).to(device)
     _train_lightning_model(model, train_data, batch_size, max_epochs)
     torch.save(model.model.state_dict(), output_model_path)
+
 
 if __name__ == "__main__":
     args = parse_args()

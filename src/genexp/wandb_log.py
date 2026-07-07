@@ -3,32 +3,29 @@ import wandb
 
 class MetricSentinel:
     def __init__(self, name: str, val: int | float | None = None, call_fn: callable = None):
-        self.val = val
         self.name = name
+        self._val = None
         self.call_fn = call_fn if call_fn is not None else lambda x: x
         
-        if self.val is not None:
-            self.call_fn(self.val)
+        if val is not None:
+            self.val = val
     
     @property
-    def value(self):
-        return self.val
+    def val(self):
+        return self._val
     
-    @value.setter
-    def value(self, val: int | float):
-        self.val = val
-        self.call_fn(self.val)
+    @val.setter
+    def val(self, val: int | float):
+        self._val = val
+        self.call_fn(val)
 
     def __iadd__(self, other: int | float):
-        self.val += other
-        self.call_fn(self.val)
+        self.val = self.val + other
         return self
     
     def __str__(self):
         return str(self.val)
-    
-    def __format__(self, format_spec):
-        return format(self.val, format_spec)
+
 
 class WandbLogger:
     def __init__(self, use_wandb: bool = False, project_name: str = "default", run_name: str = "default", config: dict = {}):

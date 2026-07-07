@@ -9,14 +9,12 @@ def plot_objective_points(
     special: torch.Tensor | None,
     save_path: Path,
 ):
-    if isinstance(special, torch.Tensor):
-        special = special.detach().cpu().numpy()
-    if isinstance(ambient, torch.Tensor):
-        ambient = ambient.detach().cpu().numpy()
+    special = special.detach().cpu().numpy()
+    ambient = ambient.detach().cpu().numpy()
 
-    assert ambient.ndim == 2 and ambient.shape[1] == 2, f"Expected ambient objective points with shape (n, 2); got {ambient.shape}"
+    assert ambient.ndim == 2 and ambient.shape[1] == 2, f"Expected ambient objective points with shape (batch, 2); got {ambient.shape}"
     if special is not None:
-        assert special.ndim == 3 and special.shape[2] == 2, f"Expected special objective points with shape (batch, n_points, 2); got {special.shape}"
+        assert special.ndim == 2 and special.shape[1] == 2, f"Expected special objective points with shape (batch, 2); got {special.shape}"
 
     fig, ax = plt.subplots(figsize=(7, 6))
     
@@ -24,12 +22,10 @@ def plot_objective_points(
     ax.scatter(ambient_x, ambient_y, s=8, alpha=0.18 if special is not None else 0.25, c="gray")
 
     if special is not None:
-        n_points = special.shape[1]
-        point_colors = plt.cm.tab10(np.linspace(0, 1, max(1, n_points)))
-        for point_idx in range(n_points):
-            special_x = special[:, point_idx, 0]
-            special_y = special[:, point_idx, 1]
-            ax.scatter(special_x, special_y, s=14, alpha=0.9, c=[point_colors[point_idx]], edgecolors="none")
+        tab10_pink = plt.cm.tab10(np.linspace(0, 1, 10))[6]
+        special_x = special[:, 0]
+        special_y = special[:, 1]
+        ax.scatter(special_x, special_y, s=14, alpha=0.9, c=[tab10_pink], edgecolors="none")
 
     ax.set_xlabel("objective 1")
     ax.set_ylabel("objective 2")
@@ -67,7 +63,8 @@ class HVComputer:
         x1_sufmax = torch.flip(torch.cummax(torch.flip(x1, dims=[-1]), dim=-1).values, dims=[-1])
 
         # Rectangle widths from ref_x and previous x
-        prev_x0 = torch.cat([torch.full_like(x0[..., :1], self.ref_point[0]), x0[..., :-1]], dim=-1)
+        # torch.full_like requires a Python scalar for the fill value; extract it with .item()
+        prev_x0 = torch.cat([torch.full_like(x0[..., :1], self.ref_point[0].item()), x0[..., :-1]], dim=-1)
         widths = (x0 - prev_x0).clamp_min(0.0)
 
         # Heights above ref_y
