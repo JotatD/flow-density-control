@@ -37,6 +37,27 @@ def plot_objective_points(
     plt.close(fig)
     print(f"Saved objective-point figure: {save_path}")
 
+def plot_clipped_values(high: float, low: float, values: np.ndarray):
+    if high <= low: raise ValueError("high must be greater than low")
+    values = np.asarray(values)
+    x = np.arange(values.size)
+    clipped = np.clip(values, low, high)
+    clipped_high = values > high
+    clipped_low = values < low
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.scatter(x, clipped, s=50)
+    ax.scatter(x[clipped_high], np.full(clipped_high.sum(), high), marker="^", s=120, label=f"Clipped above {high}")
+    ax.scatter(x[clipped_low], np.full(clipped_low.sum(), low), marker="v", s=120, label=f"Clipped below {low}")
+    for i, value in enumerate(values):
+        if value > high: ax.annotate(f"{value:,}", xy=(i, high), xytext=(0, 8), textcoords="offset points", ha="center")
+        if value < low: ax.annotate(f"{value:,}", xy=(i, low), xytext=(0, -14), textcoords="offset points", ha="center", va="top")
+    ax.axhline(0, linewidth=1)
+    ax.set_ylim(low - 15, high + 15)
+    ax.set_xlabel("Index")
+    ax.set_ylabel("Value")
+    ax.set_title("Robust visualization with clipped outliers")
+    plt.tight_layout()
+    return ax
 
 class HVComputer:
     def __init__(self, ref_point: torch.Tensor, num_rew: int = 1):

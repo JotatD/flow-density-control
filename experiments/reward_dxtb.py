@@ -1,6 +1,5 @@
 from math import isfinite
 
-from click import Path
 import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -10,17 +9,19 @@ from diffusiongym.molecules.flowmol import GEOMBaseModel
 
 from genexp.mo import DXTBDipoleL2, DXTBEnergy
 from genexp.trainers.rew_diff import RewDiff
-from utils import resolve_config, seed_everything
+from genexp.mo.utils import plot_clipped_values
+from utils import seed_everything
 import argparse
 from genexp.wandb_log import WandbLogger
 import numpy as np
+import optuna
+import os
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/reward_dxtb.yaml")
-    parser.add_argument("--config_idx", type=int, default=None)
     parser.add_argument("--problem", choices=("energy", "dipole_l2"), default="energy")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--name", type=str, default="reward_dxtb_study", help="Name of the study for logging")
     return parser.parse_args()
 
 
@@ -62,34 +63,34 @@ def evaluate_median(trainer, num_samples: int):
             rewards.append(samples)
             left -= batch_size 
     rewards = torch.stack(rewards).reshape(-1)
-    return rewards.median()[0].item(), rewards.detach().cpu()
+    rewards, _ = torch.sort(rewards)
+    return rewards.median().item(), rewards
 
-def main():
-    args = parse_args()
-    config, config_idx = resolve_config(args)
-    
+def main(config: OmegaConf) -> None:
     seed_everything(int(config.seed))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    reward_cls = {"energy": DXTBEnergy, "dipole_l2": DXTBDipoleL2}[args.problem]
+    reward_cls = {"energy": DXTBEnergy, "dipole_l2": DXTBDipoleL2}[config.problem]
     reward = reward_cls(fixed_num_atoms=int(config.fixed_num_atoms))
     env = build_environment(config, reward, device)
     trainer = RewDiff(config, env, device=device)
     num_eval_samples = int(config.get("num_eval_samples", 16))
     log = WandbLogger(
-        project_name="large_vals_dxtb",
-        config=build_wandb_config(args, config, config_idx),
-        use_wandb=args.wandb,
-        run_name=f"{args.problem}_{config_idx}",
+        project_name=config.project_name,
+        config=OmegaConf.to_container(config, resolve=True),
+        use_wandb=config.wandb,
+        run_name=config.run_name
     )
     
     global_step = log.set_step_metric(0, "global_step")
     problem_median = log.watch('problem_median', 'global_step')
+    clip_vals_img = log.set_image('clip_vals_img', 'global_step')
     data = []
     problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
+    clip_vals_img.val = plot_clipped_values(high=200, low=-30, values=rew.numpy())
     data.append(rew)
     print(
-        f"problem={args.problem} problem_eval=loaded num_samples={num_eval_samples} "
+        f"problem={config.problem} problem_eval=loaded num_samples={num_eval_samples} "
         f"problem_median={problem_median.val:.6f}",
         flush=True,
     )
@@ -102,6 +103,7 @@ def main():
             loss.val = trainer.finetune(am_dataset, steps=None)
             
             problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
+            clip_vals_img.val = plot_clipped_values(high=200, low=-30, values=rew.numpy())
             data.append(rew)
             loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
             print(
@@ -114,10 +116,51 @@ def main():
                 return
         trainer.update_base_model()
 
-    data = torch.cat(data, dim=0).detach().cpu().numpy()
-    save_path = Path(f"output/{log.project_name}/{log.run_name}")
-    np.savetxt(save_path/'rewards.csv', data, delimiter=',')
+    data = torch.stack(data, dim=0).numpy()
+    save_path = f"output/{log.project_name}/{log.run_name}/reward.csv"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    np.savetxt(save_path, data, delimiter=',')
     log.finish()
+    return problem_median.val
 
+def optuna_entry(trial: optuna.Trial):
+    args = parse_args()
+    config = {
+        "seed": 2,
+        "model_name": 'geom_gaussian',
+        "fixed_num_atoms": 10,
+        "num_md_iterations": 1,
+        "num_eval_samples": 32,
+        "alpha_div": trial.suggest_float("alpha_div", 1e-2, 1e2, log=True),
+        "lmbda": trial.suggest_float("lmbda", 1e0, 1e2, log=True),
+        "adjoint_matching": {
+            "num_iterations": 1,
+            "batch_size": 32,
+            "clip_grad_norm": 2.0,
+            "clip_loss": 1e5,
+            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            "sampling": {
+                "num_samples": 20,
+                "num_integration_steps": 40
+            }
+        },
+        "problem": args.problem,
+        "wandb": args.wandb,
+        "project_name": trial.study.study_name,
+        "run_name": f"trial_{trial.number}"
+    }
+    
+    return main(OmegaConf.create(config))
+    
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    study = optuna.create_study(
+        study_name=args.name,
+        sampler=optuna.samplers.RandomSampler(seed=42),
+        direction="maximize",
+        storage="sqlite:///optuna_store.db",
+        load_if_exists=True
+    )
+
+    study.optimize(optuna_entry, n_trials=1)
+

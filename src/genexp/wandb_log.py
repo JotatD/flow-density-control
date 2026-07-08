@@ -2,7 +2,7 @@ import wandb
 
 
 class MetricSentinel:
-    def __init__(self, name: str, val: int | float | None = None, call_fn: callable = None):
+    def __init__(self, name: str, val = None, call_fn: callable = None):
         self.name = name
         self._val = None
         self.call_fn = call_fn if call_fn is not None else lambda x: x
@@ -15,11 +15,11 @@ class MetricSentinel:
         return self._val
     
     @val.setter
-    def val(self, val: int | float):
+    def val(self, val):
         self._val = val
         self.call_fn(val)
 
-    def __iadd__(self, other: int | float):
+    def __iadd__(self, other):
         self.val = self.val + other
         return self
     
@@ -76,4 +76,24 @@ class WandbLogger:
     def finish(self):
         if self.use_wandb:
             self.run.finish()
+            
+    def set_image(self, name: str, step_metric: str):
+        if self.use_wandb:
+            if step_metric not in self.step_metrics:
+                print(f"Warning: step_metric '{step_metric}' not found in step_metrics, defaulting to logging without step.")
+                self.run.define_metric(name)
+            else:
+                self.run.define_metric(name, step_metric=step_metric)
+            
+            def call_fn(val):
+                if self.use_wandb:
+                    di = {name: wandb.Image(val)}
+                    if step_metric in self.step_metrics:
+                        di.update({step_metric: self.step_metrics[step_metric]})
+                    wandb.log(di)
+            return MetricSentinel(name, call_fn=call_fn)
+        else:
+            return MetricSentinel(name)
+
+        
     
