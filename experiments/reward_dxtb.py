@@ -1,5 +1,6 @@
 from math import isfinite
 
+from click import Path
 import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -12,12 +13,12 @@ from genexp.trainers.rew_diff import RewDiff
 from utils import resolve_config, seed_everything
 import argparse
 from genexp.wandb_log import WandbLogger
+import numpy as np
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/reward_dxtb.yaml")
     parser.add_argument("--config_idx", type=int, default=None)
-    parser.add_argument("--list_configs", action="store_true")
     parser.add_argument("--problem", choices=("energy", "dipole_l2"), default="energy")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     return parser.parse_args()
@@ -50,8 +51,8 @@ def build_wandb_config(args, config, config_idx: int) -> dict:
     }
 
 
-def evaluate_mean(trainer, num_samples: int):
-    """Evaluate the mean reward of the fine model."""
+def evaluate_median(trainer, num_samples: int):
+    """Evaluate the median reward of the fine model."""
     left = num_samples
     batch_size = trainer.config.batch_size
     rewards = []
@@ -60,7 +61,8 @@ def evaluate_mean(trainer, num_samples: int):
             samples = trainer.sample_trajectories().rewards
             rewards.append(samples)
             left -= batch_size 
-    return torch.stack(rewards).mean().item()
+    rewards = torch.stack(rewards).reshape(-1)
+    return rewards.median()[0].item(), rewards.detach().cpu()
 
 def main():
     args = parse_args()
@@ -82,12 +84,13 @@ def main():
     )
     
     global_step = log.set_step_metric(0, "global_step")
-    problem_mean = log.watch('problem_mean', 'global_step')
-    problem_mean.val = evaluate_mean(trainer, num_samples=num_eval_samples)
-    
+    problem_median = log.watch('problem_median', 'global_step')
+    data = []
+    problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
+    data.append(rew)
     print(
         f"problem={args.problem} problem_eval=loaded num_samples={num_eval_samples} "
-        f"problem_mean={problem_mean.val:.6f}",
+        f"problem_median={problem_median.val:.6f}",
         flush=True,
     )
 
@@ -98,12 +101,12 @@ def main():
             am_dataset = trainer.generate_dataset()
             loss.val = trainer.finetune(am_dataset, steps=None)
             
-            problem_mean.val = evaluate_mean(trainer, num_samples=num_eval_samples)
-            
+            problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
+            data.append(rew)
             loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
             print(
                 f"md={md_iteration + 1} adjoint={adjoint_iteration + 1} "
-                f"loss={loss_text} problem_mean={problem_mean.val:.6f}",
+                f"loss={loss_text} problem_median={problem_median.val:.6f}",
                 flush=True,
             )
             if loss_text == "nan":
@@ -111,6 +114,9 @@ def main():
                 return
         trainer.update_base_model()
 
+    data = torch.cat(data, dim=0).detach().cpu().numpy()
+    save_path = Path(f"output/{log.project_name}/{log.run_name}")
+    np.savetxt(save_path/'rewards.csv', data, delimiter=',')
     log.finish()
 
 if __name__ == "__main__":
