@@ -1,6 +1,8 @@
 import argparse
 from math import isfinite
 from pathlib import Path
+from omegaconf import OmegaConf
+import optuna
 import torch
 from genexp.mo import ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT6Torch
 from genexp.mo.utils import HVComputer
@@ -10,17 +12,19 @@ from diffusiongym.schedulers import DiffusionScheduler
 from genexp.base_models.mlp import TensorMLPModel
 from diffusiongym.environments import EpsilonEnvironment
 
-from utils import resolve_config, seed_everything
+from genexp.wandb_log import WandbLogger
+from utils import seed_everything
 from genexp.mo.utils import plot_objective_points
 import numpy as np
-import os
-from datetime import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/hv_diff_zdt.yaml")
-    parser.add_argument("--config_idx", type=int, default=None)
+    parser.add_argument("--problem", choices=("zdt1", "zdt2", "zdt3", "zdt6"), default="zdt1")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--name", type=str, default="reward_zdt1_study", help="Name of the study for logging")
+    parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for Optuna sampler")
     return parser.parse_args()
+
 
 def build_reward(problem_name: str):
     reward_specs = {
@@ -47,7 +51,7 @@ def build_diffusion_model(problem_name: str, input_dim: int, device, config):
         device=device,
     ).to(device)
     
-    model_path = Path(config.model_dir) / problem_name / "pretrained_diffusion.pth"
+    model_path = Path(f"assets/{problem_name}/models/pretrained_diffusion.pth")
     model.model.load_state_dict(torch.load(model_path, map_location=device))
     return model
 
@@ -81,19 +85,10 @@ def evaluate_hypervolume(trainer, num_samples: int, hv_computer) -> tuple[float,
 
     return n_hypervolume, full_hypervolume, reward_values
 
-def main():
-    args = parse_args()
-
-    config, _ = resolve_config(args)
-
+def main(config: OmegaConf) -> None:
     problem_name = str(config.problem).lower()
-    
     data_path = Path(f"assets/{problem_name}/data/obj.npy")
     ambient = torch.from_numpy(np.load(data_path)).float()
-    
-    figs_output_dir = Path(f"output/{problem_name}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}/")
-    os.makedirs(figs_output_dir, exist_ok=True)
-    
     
     seed_everything(int(config.seed))
     
@@ -106,40 +101,99 @@ def main():
     trainer = HVDiff(config, env, int(config.adjoint_matching.sampling.num_integration_steps), device=device)
     
     vol_samples = int(config.get("vol_samples", 256))
+    
+    log = WandbLogger(
+        project_name=config.project_name,
+        config=OmegaConf.to_container(config, resolve=True),
+        use_wandb=config.wandb,
+        run_name=config.run_name
+    )
+    
+    md_step = log.set_step_metric(0, "md_step")
+    global_step = log.set_step_metric(0, "global_step")
+    n_hv = log.watch('n_hypervolume', 'md_step')
+    full_hv = log.watch('full_hypervolume', 'md_step')
+    obj_img = log.set_image('objective_points', 'md_step')
+    
     hv_computer = HVComputer(ref_point=reward.ref_point.to(device), num_rew=reward.num_rew)
     
-    loaded_n_hv, loaded_full_hv, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
-    plot_objective_points(ambient=ambient, special=reward_values, save_path=figs_output_dir / "pretrained.png")
+    n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+    obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
     
-    print(
-        f"pretrained path {Path(config.model_dir) / problem_name / 'pretrained_diffusion.pth'} "
-        f"n_hypervolume={loaded_n_hv:.6f} full_hypervolume={loaded_full_hv:.6f} ",
-        flush=True,
-    )
+    
+    print(f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
+    loss = log.watch('loss', 'global_step')
+    try:
+        for _ in tqdm(range(config.num_md_iterations)):
+            md_step += 1
+            for am in range(config.adjoint_matching.num_iterations):
+                global_step += 1
+                am_dataset = trainer.generate_dataset()
+                loss.val = trainer.finetune(am_dataset, steps=None)
 
-    global_step = 0
-    for md_iteration in tqdm(range(config.num_md_iterations)):
-        for adjoint_iteration in range(config.adjoint_matching.num_iterations):
-            global_step += 1
-            am_dataset = trainer.generate_dataset()
-            loss = trainer.finetune(am_dataset, steps=None)
-
-            n_hv, full_hv, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
-            plot_objective_points(ambient=ambient, special=reward_values, save_path=figs_output_dir / f"md{md_iteration + 1}_adjoint{adjoint_iteration + 1}.png")
+            n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+            obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
             
-            loss_text = "nan" if not isfinite(loss) else f"{loss:.6f}"
+            loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
             print(
-                f"md={md_iteration + 1} adjoint={adjoint_iteration + 1} "
+                f"md={md_step} adjoint={am+1} "
                 f"loss={loss_text} "
-                f"n_hypervolume={n_hv:.6f} full_hypervolume={full_hv:.6f} ",
+                f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ",
                 flush=True,
             )
-            if loss_text == "nan" or not isfinite(n_hv) or not isfinite(full_hv):
+            if loss_text == "nan" or not isfinite(n_hv.val) or not isfinite(full_hv.val):
                 print("NaN detected in loss or hypervolume, stopping training.", flush=True)
-                return
-            
-        trainer.update_base_model()
+                return -20
+            trainer.update_base_model()
+    except Exception as e:
+        print(f"Error occurred during training: {e}", flush=True)
+        return -20
+    finally:
+        log.finish()
 
+def optuna_entry(trial):
+    args = parse_args()
+    config = {
+        "seed": 5,
+        "n": 4,
+        "num_md_iterations": 50,
+        "alpha_div": 1e-3,
+        "lmbda": 1000,
+        "temperature": 1e-5,
+        "num_lambda": 4000,
+        "num_p_nm1": 512,
+        "sample_p_nm1_batch_size": 64,
+        "vol_samples": 256,
+        "adjoint_matching": {
+            "num_iterations": 30,
+            "batch_size": 64,
+            "clip_grad_norm": 2.0,
+            "clip_loss": 1e5,
+            "lr": 0.001,
+            "sampling": {
+                "num_samples": 64,
+                "num_integration_steps": 40
+            }
+        },
+        "problem": args.problem,
+        "wandb": args.wandb,
+        "project_name": trial.study.study_name,
+        "run_name": f"trial_{trial.number}"
+    }
+    config = OmegaConf.create(config)
+    result = main(config)
+    return result
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    study = optuna.create_study(
+        study_name=args.name,
+        sampler=optuna.samplers.QMCSampler(seed=args.optuna_seed),
+        direction="maximize",
+        storage="sqlite:///optuna_store.db",
+        load_if_exists=True
+    )
+
+    study.optimize(optuna_entry, n_trials=128)
+
+    

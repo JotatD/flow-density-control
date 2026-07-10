@@ -6,9 +6,7 @@ from botorch.utils.multi_objective.hypervolume import Hypervolume
 
 def plot_objective_points(
     ambient: torch.Tensor,
-    special: torch.Tensor | None,
-    save_path: Path,
-):
+    special: torch.Tensor | None):
     special = special.detach().cpu().numpy()
     ambient = ambient.detach().cpu().numpy()
 
@@ -30,12 +28,9 @@ def plot_objective_points(
     ax.set_xlabel("objective 1")
     ax.set_ylabel("objective 2")
     ax.grid(True, alpha=0.3)
-
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved objective-point figure: {save_path}")
+    
+    plt.tight_layout()
+    return ax
 
 def plot_clipped_values(high: float, low: float, values: np.ndarray):
     if high <= low: raise ValueError("high must be greater than low")
