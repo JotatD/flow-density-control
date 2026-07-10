@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--problem", choices=("energy", "dipole_l2"), default="energy")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--name", type=str, default="reward_dxtb_study", help="Name of the study for logging")
+    parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for Optuna sampler")
     return parser.parse_args()
 
 
@@ -40,17 +41,6 @@ def build_environment(config, reward, device):
 
     env.sample = sample_fixed_num_atoms
     return env
-
-
-def build_wandb_config(args, config, config_idx: int) -> dict:
-    config_dict = OmegaConf.to_container(config, resolve=True)
-    return {
-        "config": args.config,
-        "config_idx": config_idx,
-        "problem": args.problem,
-        **config_dict,
-    }
-
 
 def evaluate_median(trainer, num_samples: int):
     """Evaluate the median reward of the fine model."""
@@ -96,32 +86,36 @@ def main(config: OmegaConf) -> None:
     )
 
     loss = log.watch('loss', 'global_step')
-    for md_iteration in tqdm(range(config.num_md_iterations)):
-        for adjoint_iteration in range(config.adjoint_matching.num_iterations):
-            global_step += 1
-            am_dataset = trainer.generate_dataset()
-            loss.val = trainer.finetune(am_dataset, steps=None)
-            
-            problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
-            clip_vals_img.val = plot_clipped_values(high=200, low=-30, values=rew.numpy())
-            data.append(rew)
-            loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
-            print(
-                f"md={md_iteration + 1} adjoint={adjoint_iteration + 1} "
-                f"loss={loss_text} problem_median={problem_median.val:.6f}",
-                flush=True,
-            )
-            if loss_text == "nan":
-                print("NaN loss encountered, stopping training.", flush=True)
-                return
-        trainer.update_base_model()
-
-    data = torch.stack(data, dim=0).numpy()
-    save_path = f"output/{log.project_name}/{log.run_name}/reward.csv"
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    np.savetxt(save_path, data, delimiter=',')
-    log.finish()
-    return problem_median.val
+    try:
+        for md_iteration in tqdm(range(config.num_md_iterations)):
+            for adjoint_iteration in range(config.adjoint_matching.num_iterations):
+                global_step += 1
+                am_dataset = trainer.generate_dataset()
+                loss.val = trainer.finetune(am_dataset, steps=None)
+                
+                problem_median.val, rew = evaluate_median(trainer, num_samples=num_eval_samples)
+                clip_vals_img.val = plot_clipped_values(high=200, low=-30, values=rew.numpy())
+                data.append(rew)
+                loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
+                print(
+                    f"md={md_iteration + 1} adjoint={adjoint_iteration + 1} "
+                    f"loss={loss_text} problem_median={problem_median.val:.6f}",
+                    flush=True,
+                )
+                if loss_text == "nan":
+                    print("NaN loss encountered, stopping training.", flush=True)
+                    return -20
+            trainer.update_base_model()
+        return problem_median.val
+    except Exception as e:
+        print(f"Error occurred during training: {e}", flush=True)
+        return -20
+    finally:
+        log.finish()
+        data = torch.stack(data, dim=0).numpy()
+        save_path = f"output/{log.project_name}/{log.run_name}/reward.csv"
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        np.savetxt(save_path, data, delimiter=',')
 
 def optuna_entry(trial: optuna.Trial):
     args = parse_args()
@@ -131,16 +125,16 @@ def optuna_entry(trial: optuna.Trial):
         "fixed_num_atoms": 10,
         "num_md_iterations": 1,
         "num_eval_samples": 32,
-        "alpha_div": trial.suggest_float("alpha_div", 1e-2, 1e2, log=True),
-        "lmbda": trial.suggest_float("lmbda", 1e0, 1e2, log=True),
+        "alpha_div": trial.suggest_float("alpha_div", 1e-4, 1e4, log=True),
+        "lmbda": trial.suggest_float("lmbda", 1e-4, 1e4, log=True),
         "adjoint_matching": {
-            "num_iterations": 1,
+            "num_iterations": 50,
             "batch_size": 32,
             "clip_grad_norm": 2.0,
             "clip_loss": 1e5,
-            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            "lr": trial.suggest_float("lr", 1e-6, 5e-3, log=True),
             "sampling": {
-                "num_samples": 20,
+                "num_samples": 32,
                 "num_integration_steps": 40
             }
         },
@@ -149,18 +143,20 @@ def optuna_entry(trial: optuna.Trial):
         "project_name": trial.study.study_name,
         "run_name": f"trial_{trial.number}"
     }
-    
-    return main(OmegaConf.create(config))
-    
+    config = OmegaConf.create(config)
+    result = main(config)
+
+    return result
+
 if __name__ == "__main__":
     args = parse_args()
     study = optuna.create_study(
         study_name=args.name,
-        sampler=optuna.samplers.RandomSampler(seed=42),
+        sampler=optuna.samplers.QMCSampler(seed=args.optuna_seed),
         direction="maximize",
         storage="sqlite:///optuna_store.db",
         load_if_exists=True
     )
 
-    study.optimize(optuna_entry, n_trials=1)
+    study.optimize(optuna_entry, n_trials=128)
 
