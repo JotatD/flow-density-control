@@ -185,3 +185,4 @@ scripts/sweep.sh
 assets
 output
 logs
+*.db

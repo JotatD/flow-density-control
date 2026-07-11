@@ -103,13 +103,12 @@ def main(config: OmegaConf) -> None:
                     flush=True,
                 )
                 if loss_text == "nan":
-                    print("NaN loss encountered, stopping training.", flush=True)
-                    return -20
+                    raise ValueError("Loss is NaN, stopping training.")
             trainer.update_base_model()
         return problem_median.val
     except Exception as e:
         print(f"Error occurred during training: {e}", flush=True)
-        return -20
+        return problem_median.val
     finally:
         log.finish()
         data = torch.stack(data, dim=0).numpy()
@@ -125,14 +124,14 @@ def optuna_entry(trial: optuna.Trial):
         "fixed_num_atoms": 10,
         "num_md_iterations": 1,
         "num_eval_samples": 32,
-        "alpha_div": trial.suggest_float("alpha_div", 1e-4, 1e4, log=True),
-        "lmbda": trial.suggest_float("lmbda", 1e-4, 1e4, log=True),
+        "alpha_div": trial.suggest_float("alpha_div", 0, 10),
+        "lmbda": trial.suggest_float("lmbda", 50, 650, log=True),
         "adjoint_matching": {
             "num_iterations": 50,
             "batch_size": 32,
             "clip_grad_norm": 2.0,
             "clip_loss": 1e5,
-            "lr": trial.suggest_float("lr", 1e-6, 5e-3, log=True),
+            "lr": trial.suggest_float("lr", 8.0e-5, 2.0e-4), 
             "sampling": {
                 "num_samples": 32,
                 "num_integration_steps": 40
