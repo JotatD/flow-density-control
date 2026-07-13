@@ -105,6 +105,7 @@ class DXTBEnergy(_DXTBReward):
 class DXTBDipoleL2(_DXTBReward):
     """DXTB dipole L2 norm reward."""
 
+    @torch.enable_grad()
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         dipole = self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge)
         return dipole.norm(dim=-1)
