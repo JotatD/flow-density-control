@@ -51,7 +51,7 @@ def build_diffusion_model(problem_name: str, input_dim: int, device, config):
         device=device,
     ).to(device)
     
-    model_path = Path(f"assets/{problem_name}/models/pretrained_diffusion.pth")
+    model_path = Path(f"assets/{problem_name}/pretrained_diffusion.pth")
     model.model.load_state_dict(torch.load(model_path, map_location=device))
     return model
 
@@ -64,6 +64,9 @@ def evaluate_hypervolume(trainer, num_samples: int, hv_computer) -> tuple[float,
 
     rewards = []
     collected = 0
+    old_discretization_steps = trainer.env.discretization_steps
+    trainer.env.discretization_steps = 1000
+    
     with torch.no_grad():
         while collected < num_samples:
             sample = trainer.sample_trajectories()
@@ -82,7 +85,8 @@ def evaluate_hypervolume(trainer, num_samples: int, hv_computer) -> tuple[float,
 
     n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
     full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
-
+    trainer.env.discretization_steps = old_discretization_steps
+    
     return n_hypervolume, full_hypervolume, reward_values
 
 def main(config: OmegaConf) -> None:
@@ -97,8 +101,8 @@ def main(config: OmegaConf) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reward = build_reward(problem_name)
     model = build_diffusion_model(problem_name, reward.input_dim, device, config)
-    env = EpsilonEnvironment(model, reward, device=device)
-    trainer = HVDiff(config, env, int(config.adjoint_matching.sampling.num_integration_steps), device=device)
+    env = EpsilonEnvironment(model, reward, discretization_steps=int(config.adjoint_matching.sampling.num_integration_steps))
+    trainer = HVDiff(config, env, device=device)
     
     vol_samples = int(config.get("vol_samples", 256))
     
@@ -142,26 +146,25 @@ def main(config: OmegaConf) -> None:
                 flush=True,
             )
             if loss_text == "nan" or not isfinite(n_hv.val) or not isfinite(full_hv.val):
-                print("NaN detected in loss or hypervolume, stopping training.", flush=True)
-                return -20
+                raise ValueError("Encountered NaN or infinite values in loss or hypervolume metrics.")
             trainer.update_base_model()
     except Exception as e:
         print(f"Error occurred during training: {e}", flush=True)
-        return -20
     finally:
         log.finish()
+        return full_hv.val
 
 def optuna_entry(trial):
     args = parse_args()
     config = {
         "seed": 5,
-        "n": 4,
+        "n": trial.suggest_categorical("n", [4, 8, 16, 32, 64, 128]),
         "num_md_iterations": 50,
-        "alpha_div": 1e-3,
-        "lmbda": 1000,
+        "alpha_div": trial.suggest_float("alpha_div", 1e-4, 1e-2, log=True),
+        "lmbda": trial.suggest_float("lmbda", 1e2, 1e-4, log=True),
         "temperature": 1e-5,
         "num_lambda": 4000,
-        "num_p_nm1": 512,
+        "num_p_nm1": 2048,
         "sample_p_nm1_batch_size": 64,
         "vol_samples": 256,
         "adjoint_matching": {
@@ -194,6 +197,6 @@ if __name__ == "__main__":
         load_if_exists=True
     )
 
-    study.optimize(optuna_entry, n_trials=128)
+    study.optimize(optuna_entry, n_trials=32)
 
     

@@ -105,16 +105,15 @@ def main(config: OmegaConf) -> None:
                 if loss_text == "nan":
                     raise ValueError("Loss is NaN, stopping training.")
             trainer.update_base_model()
-        return problem_median.val
     except Exception as e:
         print(f"Error occurred during training: {e}", flush=True)
-        return problem_median.val
     finally:
         log.finish()
         data = torch.stack(data, dim=0).numpy()
         save_path = f"output/{log.project_name}/{log.run_name}/reward.csv"
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         np.savetxt(save_path, data, delimiter=',')
+        return problem_median.val
 
 def optuna_entry(trial: optuna.Trial):
     args = parse_args()

@@ -43,9 +43,12 @@ class HVDiff(AMTrainerFlow):
 
         self.num_lambda = config.get("num_lambda", 4000)
         self.num_p_nm1 = config.get("num_p_nm1", 512)
+        if self.num_p_nm1 % self.n != 0:
+            self.num_p_nm1 = self.num_p_nm1 // self.n * self.n  # Ensure num_p_nm1 is divisible by n
+            print(f"Warning: num_p_nm1 is not divisible by n. Adjusting num_p_nm1 to be divisible by n. New value: {self.num_p_nm1}")
         self.sample_p_nm1_batch_size = config.get("sample_p_nm1_batch_size", -1)
         if self.sample_p_nm1_batch_size <= 0:
-            self.sample_p_nm1_batch_size = self.num_p_nm1 * (self.n - 1)
+            self.sample_p_nm1_batch_size = self.num_p_nm1 
 
         def grad_reward_fn(sample: D, latent: D) -> D:
             return self.lmbda * self.hv_gradient(sample, latent) - self.alpha_div * self.divergence(latent)
@@ -119,11 +122,13 @@ class HVDiff(AMTrainerFlow):
 
     @torch.no_grad()
     def sample_rewards(self) -> torch.Tensor:
-        num_samples = self.num_p_nm1 * (self.n - 1)
+        num_samples = self.num_p_nm1 #* (self.n - 1)
         batch_size = self.sample_p_nm1_batch_size
 
         all_rewards = []
         remaining = num_samples
+        old_discretization_steps = self.env.discretization_steps
+        self.env.discretization_steps = 1000
         while remaining > 0:
             current_batch_size = min(batch_size, remaining)
             env_sample = self.env.sample(current_batch_size, pbar=False)
@@ -134,6 +139,7 @@ class HVDiff(AMTrainerFlow):
                 rewards = rewards.unsqueeze(1)
             all_rewards.append(rewards.to(self.device))
             remaining -= current_batch_size
+        self.env.discretization_steps = old_discretization_steps
 
         rewards = torch.cat(all_rewards, dim=0)
         return rewards.reshape(self.num_p_nm1, self.n - 1, self.num_rews)

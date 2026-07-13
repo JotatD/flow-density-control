@@ -7,11 +7,11 @@ from botorch.utils.multi_objective.hypervolume import Hypervolume
 def plot_objective_points(
     ambient: torch.Tensor,
     special: torch.Tensor | None):
-    special = special.detach().cpu().numpy()
     ambient = ambient.detach().cpu().numpy()
 
     assert ambient.ndim == 2 and ambient.shape[1] == 2, f"Expected ambient objective points with shape (batch, 2); got {ambient.shape}"
     if special is not None:
+        special = special.detach().cpu().numpy()
         assert special.ndim == 2 and special.shape[1] == 2, f"Expected special objective points with shape (batch, 2); got {special.shape}"
 
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -30,6 +30,7 @@ def plot_objective_points(
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
+    plt.close(fig)
     return ax
 
 def plot_clipped_values(high: float, low: float, values: np.ndarray):
@@ -52,6 +53,7 @@ def plot_clipped_values(high: float, low: float, values: np.ndarray):
     ax.set_ylabel("Value")
     ax.set_title("Robust visualization with clipped outliers")
     plt.tight_layout()
+    plt.close(fig)
     return ax
 
 class HVComputer:
