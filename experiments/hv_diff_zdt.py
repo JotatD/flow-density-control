@@ -161,10 +161,10 @@ def optuna_entry(trial):
         "n": trial.suggest_categorical("n", [4, 8, 16, 32, 64, 128]),
         "num_md_iterations": 50,
         "alpha_div": trial.suggest_float("alpha_div", 1e-4, 1e-2, log=True),
-        "lmbda": trial.suggest_float("lmbda", 1e2, 1e-4, log=True),
+        "lmbda": trial.suggest_float("lmbda", 1e2, 1e4, log=True),
         "temperature": 1e-5,
         "num_lambda": 4000,
-        "num_p_nm1": 2048,
+        "num_p_nm1": 768,
         "sample_p_nm1_batch_size": 64,
         "vol_samples": 256,
         "adjoint_matching": {
