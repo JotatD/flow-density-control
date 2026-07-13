@@ -44,7 +44,7 @@ class HVDiff(AMTrainerFlow):
         self.num_lambda = config.get("num_lambda", 4000)
         self.num_p_nm1 = config.get("num_p_nm1", 512)
         if self.num_p_nm1 % (self.n - 1) != 0:
-            self.num_p_nm1 = self.num_p_nm1 // (self.n - 1) * (self.n - 1)  # Ensure num_p_nm1 is divisible by n
+            self.num_p_nm1 = self.num_p_nm1 - (self.num_p_nm1 % (self.n - 1))
             print(f"Warning: num_p_nm1 is not divisible by n. Adjusting num_p_nm1 to be divisible by n-1. New value: {self.num_p_nm1}")
         self.sample_p_nm1_batch_size = config.get("sample_p_nm1_batch_size", -1)
         if self.sample_p_nm1_batch_size <= 0:
