@@ -99,7 +99,7 @@ class HVDiff(AMTrainerFlow):
         return s_lambda.squeeze(-1)
 
     def max_s_lambda(self, rewards: torch.Tensor, lambda_: torch.Tensor) -> torch.Tensor:
-        assert self.num_p_nm1 == rewards.shape[0]
+        assert self.num_p_nm1  // (self.n - 1) == rewards.shape[0]
         assert self.n - 1 == rewards.shape[1]
         assert self.num_rews == rewards.shape[2]
 
@@ -124,6 +124,7 @@ class HVDiff(AMTrainerFlow):
     def sample_rewards(self) -> torch.Tensor:
         num_samples = self.num_p_nm1 #* (self.n - 1)
         batch_size = self.sample_p_nm1_batch_size
+        final_batch_size = num_samples // (self.n - 1)
 
         all_rewards = []
         remaining = num_samples
@@ -142,7 +143,7 @@ class HVDiff(AMTrainerFlow):
         self.env.discretization_steps = old_discretization_steps
 
         rewards = torch.cat(all_rewards, dim=0)
-        return rewards.reshape(self.num_p_nm1, self.n - 1, self.num_rews)
+        return rewards.reshape(final_batch_size, self.n - 1, self.num_rews)
 
     def divergence(self, latent: D) -> D:
         t = torch.zeros((len(latent),), device=latent.device, dtype=torch.float32)
