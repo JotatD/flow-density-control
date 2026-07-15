@@ -116,8 +116,9 @@ class DXTBTask(_DXTBReward):
     ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
     
     def __init__(self, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP) -> None:
-        super().__init__(fixed_num_atoms=fixed_num_atoms, atom_type_map=atom_type_map, num_rew=2, ref_point=self.ref_point)
+        super().__init__(fixed_num_atoms=fixed_num_atoms, atom_type_map=atom_type_map, num_rew=2)
 
+    @torch.enable_grad()
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
         dipole = self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
