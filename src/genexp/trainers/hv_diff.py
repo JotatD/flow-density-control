@@ -49,6 +49,8 @@ class HVDiff(AMTrainerFlow):
         self.sample_p_nm1_batch_size = config.get("sample_p_nm1_batch_size", -1)
         if self.sample_p_nm1_batch_size <= 0:
             self.sample_p_nm1_batch_size = self.num_p_nm1 
+            
+        self.sampling_kwargs = config.get("sampling_kwargs", {})
 
         def grad_reward_fn(sample: D, latent: D) -> D:
             return self.lmbda * self.hv_gradient(sample, latent) - self.alpha_div * self.divergence(latent)
@@ -67,7 +69,6 @@ class HVDiff(AMTrainerFlow):
 
     def fix_optimization_problem(self):
         self.lambda_ = self.sample_lambda_first_quadrant((self.num_lambda,)).to(self.device)
-
         with torch.no_grad():
             rewards = self.sample_rewards()
             self.max_s_lambda_X_ = self.max_s_lambda(rewards, self.lambda_)
@@ -128,19 +129,14 @@ class HVDiff(AMTrainerFlow):
 
         all_rewards = []
         remaining = num_samples
-        old_discretization_steps = self.env.discretization_steps
-        self.env.discretization_steps = 1000
         while remaining > 0:
             current_batch_size = min(batch_size, remaining)
             env_sample = self.env.sample(current_batch_size, pbar=False)
-            sample = env_sample.sample.to(self.device)
-            latent = env_sample.trajectory[-1].to(self.device)
-            rewards, _ = self.env.reward(sample, latent)
+            rewards = env_sample.rewards.to(self.device)
             if rewards.ndim == 1:
                 rewards = rewards.unsqueeze(1)
             all_rewards.append(rewards.to(self.device))
             remaining -= current_batch_size
-        self.env.discretization_steps = old_discretization_steps
 
         rewards = torch.cat(all_rewards, dim=0)
         return rewards.reshape(final_batch_size, self.n - 1, self.num_rews)

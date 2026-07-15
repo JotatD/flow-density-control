@@ -120,6 +120,8 @@ class DXTBTask(_DXTBReward):
 
     @torch.enable_grad()
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
+        calc.reset()
         energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
+        calc.reset()
         dipole = self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
         return torch.stack([-energy, dipole])
