@@ -126,7 +126,7 @@ def optuna_entry(trial: optuna.Trial) -> float:
     config = {
         "seed": 5,
         "n": 4,
-        "num_md_iterations": 50,
+        "num_md_iterations": 15,
         "alpha_div": trial.suggest_categorical(name="alpha_div", choices=[10**x for x in range(-4, 4)]),
         "lmbda": trial.suggest_categorical(name="lmbda", choices=[10**x for x in range(-4, 4)]),
         "temperature": 1e-5,
