@@ -17,13 +17,13 @@ def plot_objective_points(
     fig, ax = plt.subplots(figsize=(7, 6))
     
     ambient_x, ambient_y = ambient[:, 0], ambient[:, 1]
-    ax.scatter(ambient_x, ambient_y, s=8, alpha=0.18 if special is not None else 0.25, c="gray")
+    ax.scatter(ambient_x, ambient_y, s=8, alpha=0.05 if special is not None else 0.25, c="gray")
 
     if special is not None:
         tab10_pink = plt.cm.tab10(np.linspace(0, 1, 10))[6]
         special_x = special[:, 0]
         special_y = special[:, 1]
-        ax.scatter(special_x, special_y, s=14, alpha=0.9, c=[tab10_pink], edgecolors="none")
+        ax.scatter(special_x, special_y, s=18, alpha=1, c=[tab10_pink], edgecolors="none")
 
     ax.set_xlabel("objective 1")
     ax.set_ylabel("objective 2")

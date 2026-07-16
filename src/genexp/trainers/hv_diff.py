@@ -74,6 +74,7 @@ class HVDiff(AMTrainerFlow):
             self.max_s_lambda_X_ = self.max_s_lambda(rewards, self.lambda_)
 
     def hv_gradient(self, sample: D, latent: D) -> D:
+        # there's potential to save up some computation by doing some sort of caching of the rewards at dataset generation time, but des not seem too bottleneck
         with torch.enable_grad():
             sample_local = sample.detach().requires_grad(True)
             rewards, _ = self.env.reward(sample_local, latent)

@@ -161,6 +161,7 @@ class AMSample:
     traj_adj: list
     traj_v_base: list
     traj_sigma: list
+    rews: torch.Tensor = None
 
 
 class AMDataset(Dataset):
@@ -264,7 +265,7 @@ class AMTrainerFlow:
             traj_sigma = [d.to("cpu") for d in env_sample.diffusions]
 
             am_sample = solver.solve(sample=sample, trajectories=traj, ts=ts, traj_sigma=traj_sigma)
-
+            am_sample.rews = env_sample.rewards.to("cpu")
             datasets.append(AMDataset(am_sample))
 
         if not datasets:
@@ -296,15 +297,17 @@ class AMTrainerFlow:
             return torch.tensor(float("inf"), device=self.device)
 
         self.optimizer.zero_grad()
-        loss.backward(retain_graph=False)
 
         if self.clip_loss > 0.0:
             loss = torch.clamp(loss, min=0.0, max=self.clip_loss)
+            
+        loss.backward(retain_graph=False)
+        
         if self.clip_grad_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.fine_model.parameters(), self.clip_grad_norm)
 
         self.optimizer.step()
-        return loss
+        return [l.item() for l in losses]
 
     def finetune(self, dataset, steps=None, debug=False):
         c = 0
@@ -319,8 +322,8 @@ class AMTrainerFlow:
 
         for idx in idxs:
             sample = dataset[int(idx)]
-            loss = self.train_step(sample).item()
-            losses.append(loss)
+            loss_i = self.train_step(sample)
+            losses.extend(loss_i)
             c += 1
 
         del dataset
