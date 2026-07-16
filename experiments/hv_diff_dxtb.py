@@ -1,20 +1,21 @@
 import argparse
 from math import isfinite
 from pathlib import Path
-from omegaconf import OmegaConf
+
+import numpy as np
 import optuna
 import torch
-from genexp.mo.mo_dxtb import DXTBTask
+from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules.flowmol import GEOMBaseModel
-from genexp.mo.utils import HVComputer
-from genexp.trainers.hv_diff import HVDiff
+from omegaconf import OmegaConf
 from tqdm.auto import tqdm
-from diffusiongym.environments import EndpointEnvironment, EpsilonEnvironment
-
-from genexp.wandb_log import WandbLogger
 from utils import seed_everything
-from genexp.mo.utils import plot_objective_points
-import numpy as np
+
+from genexp.mo.mo_dxtb import DXTBTask
+from genexp.mo.utils import HVComputer, plot_objective_points
+from genexp.trainers.hv_diff import HVDiff
+from genexp.wandb_log import WandbLogger
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -133,7 +134,7 @@ def main(config: OmegaConf) -> None:
         return full_hv.val
 
 def optuna_entry(trial: optuna.Trial) -> float:
-    x = 16
+    x = 1
     args = parse_args()
     config = {
         "seed": 5,
