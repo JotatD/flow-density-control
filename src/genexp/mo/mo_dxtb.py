@@ -7,8 +7,11 @@ import dxtb
 import torch
 
 from diffusiongym.molecules.types import DDGraph
-
+from diffusiongym.molecules.rewards.utils import  is_not_fragmented, is_valid
+from diffusiongym.molecules.flowmol import get_upper_edge_mask
 from genexp.mo.base import MOReward
+from flowmol.analysis.molecule_builder import SampledMolecule
+
 
 
 ANGSTROM_TO_BOHR = 1.8897259886
@@ -53,20 +56,47 @@ class _DXTBReward(MOReward[DDGraph]):
 
         for idx, graph in enumerate(graphs):
             try:
+                self.throw_if_invalid(graph)
                 value = self._evaluate_graph(graph)
                 rewards[idx] = value.reshape(self.num_rew).to(device=sample.device, dtype=torch.float32)
                 valids[idx] = True
             except Exception as exc:
-                reasons[idx] = type(exc).__name__
+                reasons[idx] = str(exc)
 
         return rewards, {"valids": valids, "reasons": reasons}
 
+    def throw_if_invalid(self, s: dgl.DGLGraph) -> None:
+        if s.num_nodes() != self.fixed_num_atoms:
+            raise ValueError(f"DXTBReward expects {self.fixed_num_atoms} atoms per molecule; got {s.num_nodes()}")
+
+        g = s.clone()
+        
+        
+        for key in list(g.ndata.keys()):
+            if key.endswith("_t"):
+                g.ndata[key[:-2] + "_1"] = g.ndata.pop(key)
+
+        for key in list(g.edata.keys()):
+            if key.endswith("_t"):
+                g.edata[key[:-2] + "_1"] = g.edata.pop(key)
+
+        #To enable usage with SampledMolecule from flowmol
+        g.edata["ue_mask"] = get_upper_edge_mask(g)
+        
+        try:
+            mol = SampledMolecule(g.cpu(), GEOM_ATOM_TYPE_MAP).rdkit_mol
+        except Exception as e:
+            raise ValueError(f"DXTBReward expects molecules that can be converted to RDKit molecules, but got an error: {e}")
+        
+        if not is_valid(mol):
+            raise ValueError("DXTBReward expects valid molecules; got invalid molecule")
+        if not is_not_fragmented(mol):
+            raise ValueError("DXTBReward expects non-fragmented molecules; got fragmented molecule")
+        
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("DXTBReward subclasses must implement objective")
 
     def _evaluate_graph(self, graph: dgl.DGLGraph) -> torch.Tensor:
-        if graph.num_nodes() != self.fixed_num_atoms:
-            raise ValueError(f"DXTBReward expects {self.fixed_num_atoms} atoms per molecule; got {graph.num_nodes()}")
 
         atom_type_idx = graph.ndata["a_t"].argmax(dim=-1)
         atom_type_idx = torch.where(atom_type_idx < len(self.atom_type_map), atom_type_idx, torch.zeros_like(atom_type_idx))
@@ -85,7 +115,7 @@ class _DXTBReward(MOReward[DDGraph]):
         dd = {"dtype": positions.dtype, "device": positions.device}
         field = torch.zeros(3, **dd, requires_grad=True)
         electric_field = dxtb.components.field.new_efield(field, **dd)
-        calc = dxtb.calculators.GFN1Calculator(numbers, interaction=electric_field, **dd)
+        calc = dxtb.calculators.GFN2Calculator(numbers, interaction=electric_field, **dd)
         return self.objective(calc, positions, charge)
 
     @staticmethod
@@ -123,5 +153,5 @@ class DXTBTask(_DXTBReward):
         calc.reset()
         energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
         calc.reset()
-        dipole = self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
+        dipole = 2.541746 * self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
         return torch.stack([-energy, dipole])
