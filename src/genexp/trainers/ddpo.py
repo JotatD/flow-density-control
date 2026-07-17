@@ -265,7 +265,7 @@ class DDPOTrainer:
         if self.clip_grad_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.fine_model.parameters(), self.clip_grad_norm)
         self.optimizer.step()
-        return loss.detach()
+        return [l.item() for l in losses]
 
     def finetune(
         self,
@@ -288,8 +288,8 @@ class DDPOTrainer:
 
             for idx in idxs:
                 sample = dataset[int(idx)]
-                loss = self.train_step(sample).item()
-                losses.append(loss)
+                loss = self.train_step(sample)
+                losses.extend(loss)
 
         if not losses:
             return [] if debug else float("inf")
