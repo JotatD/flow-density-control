@@ -72,6 +72,21 @@ def inspect():
     
     print("rewards shape:", rewards.shape, rewards.mean(axis=0), rewards.std(axis=0))
     print("infos keys:", infos.keys(), {k: len(v) for k, v in infos.items()})
+    
+def main():
+    u_data = np.load("assets/dxtb_10A/data/obj_f.npy")
+    q05, q95 = np.quantile(u_data[:, 0], [0.002, 0.996])
+    data = u_data[(u_data[:, 0] >= q05) & (u_data[:, 0] <= q95)]
+
+    f05, f95 = np.quantile(u_data[:, 1], [0.000, 0.996])
+    data = u_data[(u_data[:, 1] >= f05) & (u_data[:, 1] <= f95)]
+
+    random_points = np.random.uniform(low=[q05, f05], high=[q95, f95], size=(1000, 2))
+    ax = plot_objective_points(ambient=torch.tensor(data), special=torch.tensor(random_points))
+
+    ax.figure.savefig("obj_f_random.png", dpi=300)
+    
+    np.save("assets/dxtb_10A/data/obj.npy", data)
 
 if __name__ == "__main__":
     main()
