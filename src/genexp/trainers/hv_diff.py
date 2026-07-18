@@ -129,18 +129,21 @@ class HVDiff(AMTrainerFlow):
         final_batch_size = num_samples // (self.n - 1)
 
         all_rewards = []
+        valids = 0 # this has to be temporary as not all rewards have valids
         remaining = num_samples
         while remaining > 0:
             current_batch_size = min(batch_size, remaining)
             env_sample = self.env.sample(current_batch_size, pbar=False)
             rewards = env_sample.rewards.to(self.device)
+            valids += env_sample.info["valids"].sum().item() # this has to be temporary as not all rewards have valids
             if rewards.ndim == 1:
                 rewards = rewards.unsqueeze(1)
             all_rewards.append(rewards.to(self.device))
             remaining -= current_batch_size
 
-        rewards = torch.cat(all_rewards, dim=0)
-        return rewards.reshape(final_batch_size, self.n - 1, self.num_rews)
+        self.rewards = torch.cat(all_rewards, dim=0)
+        self.valid_frac = valids / num_samples # this has to be temporary as not all rewards have valids
+        return self.rewards.reshape(final_batch_size, self.n - 1, self.num_rews)
 
     def divergence(self, latent: D) -> D:
         t = torch.zeros((len(latent),), device=latent.device, dtype=torch.float32)

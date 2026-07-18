@@ -27,7 +27,7 @@ def parse_args():
 
 
 
-def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discretization_steps: int = 250) -> tuple[float, float, torch.Tensor, list[Sample]]:
+def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discretization_steps: int = 250) -> tuple[float, float, torch.Tensor, list[Sample], float]:
     """Evaluate trainer-aligned n-HV and full-set HV from exactly num_samples rewards."""
     if num_samples % trainer.n != 0:
         raise ValueError(f"num_samples={num_samples} must be a multiple of n={trainer.n}")
@@ -35,6 +35,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
     rewards = []
     all_samples = []
     left = num_samples
+    valids = 0
     
     original_policy = trainer.env._policy
     trainer.env.policy = trainer.fine_model
@@ -44,6 +45,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
             sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
             rewards.append(sample.rewards)
             all_samples.append(sample.sample)
+            valids += sample.info["valids"].sum().item()
             left -= batch
     trainer.env.policy = original_policy
 
@@ -54,7 +56,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
     n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
     full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
     
-    return n_hypervolume, full_hypervolume, reward_values, all_samples
+    return n_hypervolume, full_hypervolume, reward_values, all_samples, valids / num_samples
 
 def main(config: OmegaConf) -> None:
     problem_name = "dxtb_10A"
@@ -92,14 +94,18 @@ def main(config: OmegaConf) -> None:
     n_hv = log.watch('n_hypervolume', 'md_step')
     full_hv = log.watch('full_hypervolume', 'md_step')
     obj_img = log.set_image('objective_points', 'md_step')
-    inner_hv = log.watch('inner_hypervolume', 'global_step')
+    dtst_hv = log.watch('dataset_hypervolume', 'global_step')
     inner_loss = log.watch('inner_loss', 'most_inner_step')
-    inner_img = log.set_image('inner_objective_points', 'most_inner_step')
-    
+    dtst_img = log.set_image('dataset_objective_points', 'most_inner_step')
+    valid_frac = log.watch('valid_fraction', 'md_step')
+    dtst_valid_frac = log.watch('dataset_valid_fraction', 'global_step')
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
+    nm1_hv = log.watch('nm1_hypervolume', 'md_step')
+    nm1_img = log.set_image('nm1_objective_points', 'md_step')
+    nm1_valid_frac = log.watch('nm1_valid_fraction', 'md_step')
     
     all_samples = []    
-    n_hv.val, full_hv.val, reward_values, pretrained_samples = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+    n_hv.val, full_hv.val, reward_values, pretrained_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
     obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
     all_samples.extend(pretrained_samples)
     
@@ -107,6 +113,9 @@ def main(config: OmegaConf) -> None:
     loss = log.watch('loss', 'global_step')
     try:
         for _ in tqdm(range(config.num_md_iterations)):
+            nm1_hv.val = hv_computer(trainer.rewards.unsqueeze(0)).item()
+            nm1_img.val = plot_objective_points(ambient=ambient, special=trainer.rewards)
+            nm1_valid_frac.val = trainer.valid_frac
             md_step += 1
             for am in range(config.adjoint_matching.num_iterations):
                 global_step += 1
@@ -115,13 +124,14 @@ def main(config: OmegaConf) -> None:
                 losses = trainer.finetune(am_dataset, steps=None, debug=True)
                 
                 loss.val = np.array(losses).mean().item()
-                dataset_rewards = torch.cat([d.rews for d in am_dataset], dim=0)
-                inner_hv.val = hv_computer(dataset_rewards.unsqueeze(0)).item()
-                inner_img.val = plot_objective_points(ambient=ambient, special=dataset_rewards)
+                dtst_rewards = torch.cat([d.full_env_sample.rewards for d in am_dataset], dim=0)
+                dtst_hv.val = hv_computer(dtst_rewards.unsqueeze(0)).item()
+                dtst_img.val = plot_objective_points(ambient=ambient, special=dtst_rewards)
+                dtst_valid_frac.val = sum([d.full_env_sample.info["valids"].sum().item() for d in am_dataset]) / sum([len(d.full_env_sample.sample) for d in am_dataset])
                 for l in losses: 
                     most_inner_step += 1
                     inner_loss.val = l
-            n_hv.val, full_hv.val, reward_values, new_samples = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+            n_hv.val, full_hv.val, reward_values, new_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
             all_samples.extend(new_samples)
             loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
@@ -150,22 +160,22 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "seed": 5,
         "n": 4,
         "num_md_iterations": 15,
-        "alpha_div": trial.suggest_categorical(name="alpha_div", choices=[10**x for x in range(-4, 4)]),
-        "lmbda": trial.suggest_categorical(name="lmbda", choices=[10**x for x in range(-4, 4)]),
+        "alpha_div": trial.suggest_categorical(name="alpha_div", choices=[10**x for x in range(-4, 3)]),
+        "lmbda": trial.suggest_categorical(name="lmbda", choices=[10**x for x in range(-4, 3)]),
         "temperature": 1e-5,
         "num_lambda": 400,
-        "num_p_nm1": 128 // x,
-        "sample_p_nm1_batch_size": 64 // x,
-        "vol_samples": 64 // x,
+        "num_p_nm1": 256 // x,
+        "sample_p_nm1_batch_size": 256 // x,
+        "vol_samples": 256 // x,
         "adjoint_matching": {
             "num_iterations": 10,
-            "batch_size": 64 // x,
-            "clip_grad_norm": 2.0,
-            "clip_loss": 1e5,
-            "lr": trial.suggest_categorical(name="lr", choices=[5e-5, 1e-4, 1e-3]),
+            "batch_size": 256 // x,
+            "clip_grad_norm": 2.0, # dangerous parameter?
+            "clip_loss": 1e8,
+            "lr": trial.suggest_categorical(name="lr", choices=[5e-5, 1e-4]),
             "sampling": {
-                "num_samples": 64 // x,
-                "num_integration_steps": 40
+                "num_samples": 256 // x,
+                "num_integration_steps": 100
             }
         },
         "wandb": args.wandb,

@@ -161,7 +161,7 @@ class AMSample:
     traj_adj: list
     traj_v_base: list
     traj_sigma: list
-    rews: torch.Tensor = None
+    full_env_sample: Sample[D] = None
 
 
 class AMDataset(Dataset):
@@ -265,7 +265,7 @@ class AMTrainerFlow:
             traj_sigma = [d.to("cpu") for d in env_sample.diffusions]
 
             am_sample = solver.solve(sample=sample, trajectories=traj, ts=ts, traj_sigma=traj_sigma)
-            am_sample.rews = env_sample.rewards.to("cpu")
+            am_sample.full_env_sample = env_sample
             datasets.append(AMDataset(am_sample))
 
         if not datasets:
