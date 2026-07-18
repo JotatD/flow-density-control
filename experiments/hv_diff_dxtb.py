@@ -7,6 +7,7 @@ import optuna
 import torch
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules.flowmol import GEOMBaseModel
+from diffusiongym.environments import Sample
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from utils import seed_everything
@@ -16,7 +17,7 @@ from genexp.mo.utils import HVComputer, plot_objective_points
 from genexp.trainers.hv_diff import HVDiff
 from genexp.wandb_log import WandbLogger
 
-
+import pickle as pkl
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -26,12 +27,13 @@ def parse_args():
 
 
 
-def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discretization_steps: int = 250) -> tuple[float, float, torch.Tensor]:
+def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discretization_steps: int = 250) -> tuple[float, float, torch.Tensor, list[Sample]]:
     """Evaluate trainer-aligned n-HV and full-set HV from exactly num_samples rewards."""
     if num_samples % trainer.n != 0:
         raise ValueError(f"num_samples={num_samples} must be a multiple of n={trainer.n}")
 
     rewards = []
+    all_samples = []
     left = num_samples
     
     original_policy = trainer.env._policy
@@ -41,6 +43,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
             batch = min(left, trainer.config.batch_size)
             sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
             rewards.append(sample.rewards)
+            all_samples.append(sample.sample)
             left -= batch
     trainer.env.policy = original_policy
 
@@ -51,7 +54,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
     n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
     full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
     
-    return n_hypervolume, full_hypervolume, reward_values
+    return n_hypervolume, full_hypervolume, reward_values, all_samples
 
 def main(config: OmegaConf) -> None:
     problem_name = "dxtb_10A"
@@ -69,6 +72,9 @@ def main(config: OmegaConf) -> None:
     unconstrained_sample = env.sample
     env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)
     trainer = HVDiff(config, env, device=device)
+    folder = Path(f"output/{config.project_name}/{config.run_name}")
+    folder.mkdir(parents=True, exist_ok=True)
+
     
     vol_samples = int(config.get("vol_samples", 256))
     
@@ -92,9 +98,10 @@ def main(config: OmegaConf) -> None:
     
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     
-    n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+    all_samples = []    
+    n_hv.val, full_hv.val, reward_values, pretrained_samples = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
     obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-    
+    all_samples.extend(pretrained_samples)
     
     print(f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
     loss = log.watch('loss', 'global_step')
@@ -114,22 +121,25 @@ def main(config: OmegaConf) -> None:
                 for l in losses: 
                     most_inner_step += 1
                     inner_loss.val = l
-            n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
+            n_hv.val, full_hv.val, reward_values, new_samples = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-            
+            all_samples.extend(new_samples)
             loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
-            print(
-                f"md={md_step} adjoint={am+1} "
-                f"loss={loss_text} "
-                f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ",
-                flush=True,
-            )
+            print(f"md={md_step} adjoint={am+1} loss={loss_text} n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
             if not isfinite(n_hv.val) or not isfinite(full_hv.val):
                 raise ValueError("Encountered NaN or infinite values in loss or hypervolume metrics.")
             trainer.update_base_model()
+            
+            torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
+            if full_hv.is_curr_max():
+                print(f"New best hypervolume: {full_hv.val:.6f} at step {md_step}", flush=True)
+                torch.save(trainer.fine_model.state_dict(), folder / "model_best.pth")
     except Exception as e:
         print(f"Error occurred during training: {e}", flush=True)
     finally:
+        torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
+        with open(folder / "all_samples.pkl", "wb") as f:
+            pkl.dump(all_samples, f)
         log.finish()
         return full_hv.val
 
