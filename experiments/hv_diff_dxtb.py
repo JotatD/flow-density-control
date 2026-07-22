@@ -1,13 +1,14 @@
 import argparse
+import pickle as pkl
+import traceback
 from math import isfinite
 from pathlib import Path
 
 import numpy as np
 import optuna
 import torch
-from diffusiongym.environments import EndpointEnvironment
+from diffusiongym.environments import EndpointEnvironment, Sample
 from diffusiongym.molecules.flowmol import GEOMBaseModel
-from diffusiongym.environments import Sample
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from utils import seed_everything
@@ -16,9 +17,8 @@ from genexp.mo.mo_dxtb import DXTBTask
 from genexp.mo.utils import HVComputer, plot_objective_points
 from genexp.trainers.hv_diff import HVDiff
 from genexp.wandb_log import WandbLogger
-import traceback
 
-import pickle as pkl
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -178,16 +178,16 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "temperature": 1e-5,
         "num_lambda": 400,
         "num_p_nm1": 256 // x,
-        "sample_p_nm1_batch_size": 256 // x,
+        "sample_p_nm1_batch_size": 64 // x,
         "vol_samples": 256 // x,
         "adjoint_matching": {
             "num_iterations": 10,
-            "batch_size": 256 // x,
+            "batch_size": 64 // x,
             "clip_grad_norm": 2.0, # dangerous parameter?
-            "clip_loss": 1e8,
+            "clip_loss": 1e10,
             "lr": trial.suggest_categorical(name="lr", choices=[5e-5, 1e-4]),
             "sampling": {
-                "num_samples": 256 // x,
+                "num_samples": 64 // x,
                 "num_integration_steps": 100
             }
         },
