@@ -16,6 +16,7 @@ from genexp.mo.mo_dxtb import DXTBTask
 from genexp.mo.utils import HVComputer, plot_objective_points
 from genexp.trainers.hv_diff import HVDiff
 from genexp.wandb_log import WandbLogger
+import traceback
 
 import pickle as pkl
 def parse_args():
@@ -44,7 +45,7 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
             batch = min(left, trainer.config.batch_size)
             sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
             rewards.append(sample.rewards)
-            all_samples.append(sample.sample)
+            all_samples.append(sample)
             valids += sample.info["valids"].sum().item()
             left -= batch
     trainer.env.policy = original_policy
@@ -60,15 +61,20 @@ def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discret
 
 def main(config: OmegaConf) -> None:
     problem_name = "dxtb_10A"
-    data_path = Path(f"assets/{problem_name}/data/obj.npy")
+    data_path = Path(f"assets/{problem_name}/data/obj_lf2.npy")
     ambient = torch.from_numpy(np.load(data_path)).float()
+    scaling_factor = torch.ones((2,))
+    if config.scale:
+        scaling_factor = ambient.mean(axis=0)
+        print(scaling_factor)
+        ambient = ambient / scaling_factor
     
     seed_everything(int(config.seed))
     
     print(f"problem={problem_name}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    reward = DXTBTask(fixed_num_atoms=10)
+    reward = DXTBTask(fixed_num_atoms=10, scaling_factor=scaling_factor.to(device))
     model =  GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, reward, discretization_steps=int(config.adjoint_matching.sampling.num_integration_steps))
     unconstrained_sample = env.sample
@@ -131,6 +137,8 @@ def main(config: OmegaConf) -> None:
                 for l in losses: 
                     most_inner_step += 1
                     inner_loss.val = l
+                del am_dataset
+
             n_hv.val, full_hv.val, reward_values, new_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
             all_samples.extend(new_samples)
@@ -143,9 +151,14 @@ def main(config: OmegaConf) -> None:
             torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
             if full_hv.is_curr_max():
                 print(f"New best hypervolume: {full_hv.val:.6f} at step {md_step}", flush=True)
-                torch.save(trainer.fine_model.state_dict(), folder / "model_best.pth")
+                torch.save(trainer.fine_model.state_dict(), folder / "model_best.pth")                
     except Exception as e:
+        traceback.print_exc()
         print(f"Error occurred during training: {e}", flush=True)
+        torch.save(trainer.fine_model.state_dict(), folder / "model_last_fine.pth")
+        torch.save(trainer.base_model.state_dict(), folder / "model_last_base.pth")
+        with open(folder / "dataset.pkl", "wb") as f:
+            pkl.dump(am_dataset, f)
     finally:
         torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
         with open(folder / "all_samples.pkl", "wb") as f:
@@ -180,7 +193,8 @@ def optuna_entry(trial: optuna.Trial) -> float:
         },
         "wandb": args.wandb,
         "project_name": trial.study.study_name,
-        "run_name": f"trial_{trial.number}"
+        "run_name": f"{trial.number}",
+        "scale": trial.suggest_categorical(name="scale", choices=[True, False]),
     }
     config = OmegaConf.create(config)
     result = main(config)

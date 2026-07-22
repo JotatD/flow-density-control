@@ -193,7 +193,9 @@ def adj_matching_loss(v_base, v_fine, adj, sigma) -> torch.Tensor:
     term_diff = (diff / sigma) * 2
     term_adj = sigma * adj
     term_difference = term_diff - term_adj
-    return (term_difference**2).aggregate("sum").mean()
+    loss_per_sample = (term_difference**2).aggregate("mean")
+    loss_per_sample = loss_per_sample[torch.isfinite(loss_per_sample)]
+    return loss_per_sample.mean() if loss_per_sample.numel() > 0 else None
 
 
 class AMTrainerFlow:
@@ -287,14 +289,15 @@ class AMTrainerFlow:
             t = ts[idx].unsqueeze(0).expand(n)
             v_fine_t = _velocity(self.fine_model, traj_x[idx], t)
             loss_t = adj_matching_loss(traj_v_base[idx], v_fine_t, traj_adj[idx], traj_sigma[idx])
+            if loss_t is None:
+                print(f"Warning: AM loss return None, which means no finite values were found for the loss at timestep {idx} through the batch.")
+                continue
             losses.append(loss_t)
 
         if not losses:
-            return torch.tensor(float("inf"), device=self.device)
+            return []
 
         loss = torch.stack(losses).mean()
-        if loss.isnan().any():
-            return torch.tensor(float("inf"), device=self.device)
 
         self.optimizer.zero_grad()
 

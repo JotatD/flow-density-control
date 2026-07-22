@@ -21,6 +21,10 @@ def main():
     with open(sample_path, 'rb') as f:
         samples = pkl.load(f)
 
+    dxtb_reward = DXTBTask(fixed_num_atoms=10)
+    # xtb_reward = XTBTask(do_relax=True)
+    # dxtb_reward = DXTBTask(fixed_num_atoms=10)
+    # xtb_reward = XTBTask(do_relax=True)
     for i, s in enumerate(samples):
         g = s.clone()
         for key in list(g.graph.ndata.keys()):
@@ -34,18 +38,14 @@ def main():
         #To enable usage with SampledMolecule from flowmol
         g.graph.edata["ue_mask"] = get_upper_edge_mask(g.graph)
 
-        dxtb_reward = DXTBTask(fixed_num_atoms=10)
-        # xtb_reward = XTBTask(do_relax=True)
-
         dxtb_value, dxtb_info = dxtb_reward(s, s)
-        # xtb_value, xtb_info = xtb_reward(g, g)
 
-        print("DXTB:", dxtb_value[0], dxtb_info)
+        # print("DXTB:", dxtb_value[0], dxtb_info)
 
         z_data.append(dxtb_value[0].detach().cpu().numpy())
         
         z_info.append(dxtb_info) 
-        print('-'*30)
+        # print('-'*30)
         
     final_info = z_info[0]
     for k, v in final_info.items():
@@ -58,8 +58,8 @@ def main():
             final_info[k] = np.concatenate([inf[k].detach().cpu().numpy() for inf in z_info], axis=0)
 
 
-    np.save("assets/dxtb_10A/data/obj_f.npy", z_data)
-    with open("assets/dxtb_10A/data/info_f.pkl", "wb") as f:
+    np.save("assets/dxtb_10A/data/obj_lf.npy", z_data)
+    with open("assets/dxtb_10A/data/info_lf.pkl", "wb") as f:
         pkl.dump(final_info, f)
         
 
@@ -73,21 +73,21 @@ def inspect():
     print("rewards shape:", rewards.shape, rewards.mean(axis=0), rewards.std(axis=0))
     print("infos keys:", infos.keys(), {k: len(v) for k, v in infos.items()})
     
-def main():
-    u_data = np.load("assets/dxtb_10A/data/obj_f.npy")
-    q05, q95 = np.quantile(u_data[:, 0], [0.002, 0.996])
-    data = u_data[(u_data[:, 0] >= q05) & (u_data[:, 0] <= q95)]
+# def main():
+#     u_data = np.load("assets/dxtb_10A/data/obj_f.npy")
+#     q05, q95 = np.quantile(u_data[:, 0], [0.002, 0.996])
+#     data = u_data[(u_data[:, 0] >= q05) & (u_data[:, 0] <= q95)]
 
-    f05, f95 = np.quantile(u_data[:, 1], [0.000, 0.996])
-    data = u_data[(u_data[:, 1] >= f05) & (u_data[:, 1] <= f95)]
+#     f05, f95 = np.quantile(u_data[:, 1], [0.000, 0.996])
+#     data = u_data[(u_data[:, 1] >= f05) & (u_data[:, 1] <= f95)]
 
-    random_points = np.random.uniform(low=[q05, f05], high=[q95, f95], size=(1000, 2))
-    ax = plot_objective_points(ambient=torch.tensor(data), special=torch.tensor(random_points))
+#     random_points = np.random.uniform(low=[q05, f05], high=[q95, f95], size=(1000, 2))
+#     ax = plot_objective_points(ambient=torch.tensor(data), special=torch.tensor(random_points))
 
-    ax.figure.savefig("obj_f_random.png", dpi=300)
+#     ax.figure.savefig("obj_f_random.png", dpi=300)
     
-    np.save("assets/dxtb_10A/data/obj.npy", data)
+#     np.save("assets/dxtb_10A/data/obj.npy", data)
 
 if __name__ == "__main__":
     main()
-    inspect()
+    # inspect()

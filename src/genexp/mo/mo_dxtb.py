@@ -56,7 +56,7 @@ class _DXTBReward(MOReward[DDGraph]):
 
         for idx, graph in enumerate(graphs):
             try:
-                self.throw_if_invalid(graph)
+                # self.throw_if_invalid(graph)
                 value = self._evaluate_graph(graph)
                 rewards[idx] = value.reshape(self.num_rew).to(device=sample.device, dtype=torch.float32)
                 valids[idx] = True
@@ -145,13 +145,18 @@ class DXTBTask(_DXTBReward):
     """DXTB two-objective reward with negative energy and dipole L2 norm."""
     ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
     
-    def __init__(self, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP) -> None:
+    def __init__(self, scaling_factor: torch.Tensor, fixed_num_atoms: int = 10, atom_type_map: Sequence[str] = GEOM_ATOM_TYPE_MAP) -> None:
+        self.scaling_factor = scaling_factor if scaling_factor is not None else torch.ones((2)) 
         super().__init__(fixed_num_atoms=fixed_num_atoms, atom_type_map=atom_type_map, num_rew=2)
 
     @torch.enable_grad()
     def objective(self, calc: Any, positions: torch.Tensor, charge: torch.Tensor) -> torch.Tensor:
         calc.reset()
-        energy = self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
+        energy = -self._silent_dxtb_call(calc.get_energy, positions, chrg=charge, maxiter=500).reshape(())
+        if energy < 0.0 or energy > 45.0:
+            raise ValueError(f"DXTBReward expects energies in the range [0, 45]; got {energy.item()}")
         calc.reset()
         dipole = 2.541746 * self._silent_dxtb_call(calc.get_dipole, positions, chrg=charge).norm(dim=-1).reshape(())
-        return torch.stack([-energy, dipole])
+        if dipole < 0.0 or dipole > 30.0:
+            raise ValueError(f"DXTBReward expects dipoles in the range [0, 30]; got {dipole.item()}")
+        return torch.stack([energy, dipole]) / self.scaling_factor
