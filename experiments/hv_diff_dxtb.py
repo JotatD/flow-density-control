@@ -133,6 +133,7 @@ def main(config: OmegaConf) -> None:
                 with open(folder / f"dataset_{global_step}.pkl", "wb") as f:
                     pkl.dump(am_dataset, f)
                 dtst_rewards = torch.cat([d.full_env_sample.rewards for d in am_dataset], dim=0)
+                torch.save(dtst_rewards, folder / f"dataset_rewards_{global_step}.pt")
                 dtst_hv.val = hv_computer(dtst_rewards.unsqueeze(0)).item()
                 dtst_img.val = plot_objective_points(ambient=ambient, special=dtst_rewards)
                 dtst_valid_frac.val = sum([d.full_env_sample.info["valids"].sum().item() for d in am_dataset]) / sum([len(d.full_env_sample.sample) for d in am_dataset])
