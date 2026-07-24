@@ -105,7 +105,7 @@ def main(config: OmegaConf) -> None:
     obj_img = log.set_image('objective_points', 'md_step')
     dtst_hv = log.watch('dataset_hypervolume', 'global_step')
     inner_loss = log.watch('inner_loss', 'most_inner_step')
-    dtst_img = log.set_image('dataset_objective_points', 'most_inner_step')
+    dtst_img = log.set_image('dataset_objective_points', 'global_step')
     valid_frac = log.watch('valid_fraction', 'md_step')
     dtst_valid_frac = log.watch('dataset_valid_fraction', 'global_step')
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
@@ -125,20 +125,24 @@ def main(config: OmegaConf) -> None:
             nm1_img.val = plot_objective_points(ambient=ambient, special=trainer.rewards)
             nm1_valid_frac.val = trainer.valid_frac
             md_step += 1
+            torch.save(trainer.base_model.state_dict(), folder / f"model_gb_{global_step}_base.pth")
             for am in range(config.adjoint_matching.num_iterations):
                 global_step += 1
                 
                 am_dataset = trainer.generate_dataset()
-                losses = trainer.finetune(am_dataset, steps=None, debug=True)
-                
-                loss.val = np.array(losses).mean().item()
+                with open(folder / f"dataset_{global_step}.pkl", "wb") as f:
+                    pkl.dump(am_dataset, f)
                 dtst_rewards = torch.cat([d.full_env_sample.rewards for d in am_dataset], dim=0)
                 dtst_hv.val = hv_computer(dtst_rewards.unsqueeze(0)).item()
                 dtst_img.val = plot_objective_points(ambient=ambient, special=dtst_rewards)
                 dtst_valid_frac.val = sum([d.full_env_sample.info["valids"].sum().item() for d in am_dataset]) / sum([len(d.full_env_sample.sample) for d in am_dataset])
+                
+                losses = trainer.finetune(am_dataset, steps=None, debug=True)
+                loss.val = np.array(losses).mean().item()
                 for l in losses: 
                     most_inner_step += 1
                     inner_loss.val = l
+                torch.save(trainer.fine_model.state_dict(), folder / f"model_gb_{global_step}_fine.pth")
 
             n_hv.val, full_hv.val, reward_values, new_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
@@ -149,7 +153,7 @@ def main(config: OmegaConf) -> None:
                 raise ValueError("Encountered NaN or infinite values in loss or hypervolume metrics.")
             trainer.update_base_model()
             
-            torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
+            # torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
             if full_hv.is_curr_max():
                 print(f"New best hypervolume: {full_hv.val:.6f} at step {md_step}", flush=True)
                 torch.save(trainer.fine_model.state_dict(), folder / "model_best.pth")                
@@ -162,8 +166,6 @@ def main(config: OmegaConf) -> None:
             pkl.dump(am_dataset, f)
     finally:
         torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
-        with open(folder / "all_samples.pkl", "wb") as f:
-            pkl.dump(all_samples, f)
         log.finish()
         return full_hv.val
 
