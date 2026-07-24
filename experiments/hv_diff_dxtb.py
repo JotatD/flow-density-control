@@ -26,7 +26,10 @@ def parse_args():
     parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for Optuna sampler")
     return parser.parse_args()
 
-
+def dump_samples(samples: list[Sample], filename: str) -> None:
+    """Dump a list of Sample objects to a file using pickle."""
+    with open(filename, "wb") as f:
+        pkl.dump(samples, f)
 
 def evaluate_hypervolume(trainer: HVDiff, num_samples: int, hv_computer, discretization_steps: int = 250) -> tuple[float, float, torch.Tensor, list[Sample], float]:
     """Evaluate trainer-aligned n-HV and full-set HV from exactly num_samples rewards."""
@@ -110,10 +113,9 @@ def main(config: OmegaConf) -> None:
     nm1_img = log.set_image('nm1_objective_points', 'md_step')
     nm1_valid_frac = log.watch('nm1_valid_fraction', 'md_step')
     
-    all_samples = []    
     n_hv.val, full_hv.val, reward_values, pretrained_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
     obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-    all_samples.extend(pretrained_samples)
+    dump_samples(pretrained_samples, folder / "0.pkl")
     
     print(f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
     loss = log.watch('loss', 'global_step')
@@ -137,11 +139,10 @@ def main(config: OmegaConf) -> None:
                 for l in losses: 
                     most_inner_step += 1
                     inner_loss.val = l
-                del am_dataset
 
             n_hv.val, full_hv.val, reward_values, new_samples, valid_frac.val = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-            all_samples.extend(new_samples)
+            dump_samples(new_samples, folder / f"{md_step}.pkl")
             loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
             print(f"md={md_step} adjoint={am+1} loss={loss_text} n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
             if not isfinite(n_hv.val) or not isfinite(full_hv.val):
