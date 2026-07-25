@@ -187,15 +187,20 @@ def create_timestep_subset(total_steps, final_percent=0.25, sample_percent=0.25)
     return np.sort(np.concatenate([final_samples, additional_samples]))
 
 
-def adj_matching_loss(v_base, v_fine, adj, sigma) -> torch.Tensor:
+def adj_matching_loss(v_base_b, v_fine_b, adj_b, sigma_b) -> torch.Tensor:
     """Adjoint matching loss for a single timestep batch (D-typed inputs)."""
-    diff = v_fine - v_base
-    term_diff = (diff / sigma) * 2
-    term_adj = sigma * adj
-    term_difference = term_diff - term_adj
-    loss_per_sample = (term_difference**2).aggregate("mean")
-    loss_per_sample = loss_per_sample[torch.isfinite(loss_per_sample)]
-    return loss_per_sample.mean() if loss_per_sample.numel() > 0 else None
+    loss_per_sample = []
+    for i in range(len(v_base_b)):
+        v_base, v_fine, adj, sigma = v_base_b[i], v_fine_b[i], adj_b[i], sigma_b[i] 
+        diff = v_fine - v_base
+        term_diff = (diff / sigma) * 2
+        term_adj = sigma * adj
+        term_difference = term_diff - term_adj
+        loss_sample = (term_difference**2).aggregate("mean")
+        if torch.all(torch.isfinite(loss_sample)):
+            loss_per_sample.append(loss_sample) 
+    loss_per_sample = torch.stack(loss_per_sample)
+    return loss_per_sample.mean()
 
 
 class AMTrainerFlow:
