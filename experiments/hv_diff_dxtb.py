@@ -165,6 +165,8 @@ def main(config: OmegaConf) -> None:
         torch.save(trainer.base_model.state_dict(), folder / "model_last_base.pth")
         with open(folder / "dataset.pkl", "wb") as f:
             pkl.dump(am_dataset, f)
+        with open(folder / "trainer.pkl", "wb") as f:
+            pkl.dump(trainer, f)
     finally:
         torch.save(trainer.fine_model.state_dict(), folder / "model_last.pth")
         log.finish()
