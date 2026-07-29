@@ -1,14 +1,18 @@
 """Multi-objective rewards."""
 
 from genexp.mo.base import CombinedRewards, MOReward
-from genexp.mo.mo_dxtb import DXTBDipoleL2, DXTBEnergy, DXTBTask
+dxtb = []
+try:
+    from genexp.mo.dxtb import DXTBDipoleL2, DXTBEnergy, DXTBTask
+    dxtb = ["DXTBDipoleL2", "DXTBEnergy", "DXTBTask"]
+except ImportError:
+    dxtb = []
+    pass
+
 from genexp.mo.zdt import ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT4Torch, ZDT6Torch
 
-__all__ = [
+base = [
     "CombinedRewards",
-    "DXTBDipoleL2",
-    "DXTBEnergy",
-    "DXTBTask",
     "MOReward",
     "ZDT1Torch",
     "ZDT2Torch",
@@ -16,3 +20,6 @@ __all__ = [
     "ZDT4Torch",
     "ZDT6Torch",
 ]
+
+base.extend(dxtb)
+__all__ = base
