@@ -3,44 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, Dataset
 
 from diffusiongym.types import DDTensor
 
 from peptidesgym.model import DiscreteModel
 from peptidesgym.env import DiscreteEnvironment, DiscreteSample
 
-ScalarReward = Callable[..., Any]
-
-
-def _config_get(config: Any, key: str, default: Any) -> Any:
-    if hasattr(config, "get"):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
 
 @dataclass
-class DMPOSample:
-    """A rollout batch and its detached DMPO importance statistics."""
+class DMPOSample(DiscreteSample[DDTensor]):
+    """Discrete rollout trajectories and their detached DMPO statistics."""
 
-    ts: torch.Tensor
     log_importance: torch.Tensor
-    x_final: DDTensor
-    rewards: torch.Tensor
     log_reference_minus_policy: torch.Tensor
-    full_env_sample: DiscreteSample[DDTensor] | None = None
-
-    @property
-    def log_rnd(self) -> torch.Tensor:
-        """Backward-compatible name for the complete log importance weight."""
-        return self.log_importance
 
     def __post_init__(self) -> None:
-        batch_size = len(self.x_final)
+        super().__post_init__()
+        batch_size = len(self)
         for name, value in (
             ("log_importance", self.log_importance),
             ("rewards", self.rewards),
@@ -53,20 +36,54 @@ class DMPOSample:
             if not torch.isfinite(value).all():
                 raise ValueError(f"{name} contains non-finite values")
 
-
-class DMPODataset(Dataset[DMPOSample]):
-    """A one-item dataset that preserves rollout batches for normalized weights."""
-
-    def __init__(self, dmpo_sample: DMPOSample):
-        self.sample = dmpo_sample
-
-    def __len__(self) -> int:
-        return 1
-
     def __getitem__(self, index: int) -> DMPOSample:
-        if index not in (0, -1):
-            raise IndexError(index)
-        return self.sample
+        index = range(len(self))[index]
+        sample = super().__getitem__(index)
+        return DMPOSample(
+            sample=sample.sample,
+            latent=sample.latent,
+            trajectory=sample.trajectory,
+            timesteps=sample.timesteps,
+            log_p=sample.log_p,
+            rewards=sample.rewards,
+            info=sample.info,
+            kwargs=sample.kwargs,
+            log_importance=self.log_importance[index : index + 1],
+            log_reference_minus_policy=self.log_reference_minus_policy[index : index + 1],
+        )
+
+    @staticmethod
+    def concat(samples: list[DMPOSample]) -> DMPOSample:
+        sample = DiscreteSample.concat(samples)
+        return DMPOSample(
+            sample=sample.sample,
+            latent=sample.latent,
+            trajectory=sample.trajectory,
+            timesteps=sample.timesteps,
+            log_p=sample.log_p,
+            rewards=sample.rewards,
+            info=sample.info,
+            kwargs=sample.kwargs,
+            log_importance=torch.cat([item.log_importance for item in samples]),
+            log_reference_minus_policy=torch.cat(
+                [item.log_reference_minus_policy for item in samples]
+            ),
+        )
+
+    def to(self, device: torch.device | str) -> DMPOSample:
+        sample = super().to(device)
+        return DMPOSample(
+            sample=sample.sample,
+            latent=sample.latent,
+            trajectory=sample.trajectory,
+            timesteps=sample.timesteps,
+            log_p=sample.log_p,
+            rewards=sample.rewards,
+            info=sample.info,
+            kwargs=sample.kwargs,
+            log_importance=self.log_importance.to(device),
+            log_reference_minus_policy=self.log_reference_minus_policy.to(device),
+        )
 
 
 def loss_wdce(
@@ -86,11 +103,6 @@ def loss_wdce(
     estimator of the full denoising objective.  Importance weights are
     detached because rollout collection is off-policy.
     """
-    if num_replicates < 1:
-        raise ValueError("num_replicates must be positive")
-    if not 0 < eps < 1:
-        raise ValueError("eps must be in (0, 1)")
-
     tokens = x.data if isinstance(x, DDTensor) else x
     tokens = tokens.to(policy_model.device)
     if tokens.ndim != 2:
@@ -142,7 +154,6 @@ class DMPOTrainer:
         env: DiscreteEnvironment,
         fine_model: DiscreteModel,
         base_model: DiscreteModel,
-        reward_fn: ScalarReward,
         device: torch.device | None = None,
         verbose: bool = False,
     ):
@@ -161,7 +172,6 @@ class DMPOTrainer:
         self.fine_model = fine_model.to(self.device)
         self.base_model = base_model.to(self.device)
         self.env.base_model = self.fine_model
-        self.reward_fn = reward_fn
         self.base_model.eval()
         self.base_model.requires_grad_(False)
         self.last_metrics: dict[str, float] = {}
@@ -178,7 +188,7 @@ class DMPOTrainer:
     def get_model(self) -> DiscreteModel:
         return self.fine_model
 
-    def generate_dataset(self) -> ConcatDataset[DMPOSample]:
+    def generate_dataset(self) -> DMPOSample:
         """Collect rollout batches and compute detached importance weights."""
         num_samples = int(self.sampling_config.num_samples)
         batch_size = int(self.config.batch_size)
@@ -187,7 +197,7 @@ class DMPOTrainer:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
 
-        datasets: list[DMPODataset] = []
+        samples: list[DMPOSample] = []
         self.fine_model.eval()
         self.base_model.eval()
 
@@ -195,28 +205,16 @@ class DMPOTrainer:
             current_batch_size = min(batch_size, num_samples - start)
             env_sample = self.env.sample(current_batch_size, pbar=False)
             env_sample = env_sample.to(self.device)
-            reward_values  = self.reward_fn(env_sample)
-            dmpo_sample = self.solve(
-                samples=env_sample.latent,
-                trajectory=env_sample.trajectory,
-                log_ps=env_sample.log_p,
-                timestep=env_sample.timesteps,
-                rewards=reward_values,
-            )
-            dmpo_sample.full_env_sample = env_sample.to("cpu")
-            datasets.append(DMPODataset(dmpo_sample))
-        return ConcatDataset(datasets)
+            samples.append(self.solve(env_sample))
+        return DMPOSample.concat(samples)
 
     @torch.no_grad()
-    def solve(
-        self,
-        samples: DDTensor,
-        trajectory: Sequence[DDTensor],
-        log_ps: Sequence[DDTensor],
-        timestep: torch.Tensor,
-        rewards: torch.Tensor,
-    ) -> DMPOSample:
+    def solve(self, env_sample: DiscreteSample[DDTensor]) -> DMPOSample:
         """Compute exact discretized trajectory likelihood ratios."""
+        samples = env_sample.latent
+        trajectory = env_sample.trajectory
+        log_ps = env_sample.log_p
+        timestep = env_sample.timesteps
         num_steps = timestep.numel() - 1
         assert len(trajectory) == num_steps + 1 and len(log_ps) == num_steps, (
             "Trajectory and log_ps lengths must match timestep length"
@@ -236,25 +234,31 @@ class DMPOTrainer:
             log_ratio += (reference_log_p - policy_log_p).sum(dim=-1)
 
         reward_values = torch.as_tensor(
-            rewards,
+            env_sample.rewards,
             dtype=log_ratio.dtype,
             device=self.device,
         )
         if reward_values.shape != (batch_size,):
             raise ValueError(
-                f"reward_fn must return shape ({batch_size},), "
+                f"Environment rewards must have shape ({batch_size},), "
                 f"got {tuple(reward_values.shape)}"
             )
         if not torch.isfinite(reward_values).all():
-            raise ValueError("reward_fn returned non-finite values")
+            raise ValueError("Environment rewards contain non-finite values")
         log_importance = (
             log_ratio + reward_values / self.alpha
         ) * self.importance_coefficient
+        sample = env_sample.to("cpu")
         return DMPOSample(
-            ts=timestep.detach().cpu(),
+            sample=sample.sample,
+            latent=sample.latent,
+            trajectory=sample.trajectory,
+            timesteps=sample.timesteps,
+            log_p=sample.log_p,
+            rewards=sample.rewards,
+            info=sample.info,
+            kwargs=sample.kwargs,
             log_importance=log_importance.detach().cpu(),
-            x_final=samples.detach().to("cpu"),
-            rewards=reward_values.detach().cpu(),
             log_reference_minus_policy=log_ratio.detach().cpu(),
         )
 
@@ -264,10 +268,10 @@ class DMPOTrainer:
         loss = loss_wdce(
             self.fine_model,
             sample.log_importance,
-            sample.x_final,
-            num_replicates=int(self.config.num_replicates),
-            eps=float(self.config.get("mask_eps", 1e-3)),
-            centering=bool(self.config.get("centering", False)),
+            sample.latent,
+            num_replicates=self.config.num_replicates,
+            eps=self.config.get("mask_eps", 1e-3),
+            centering=self.config.get("centering", False),
         )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite DMPO loss: {loss.item()}")
@@ -277,7 +281,7 @@ class DMPOTrainer:
         grad_norm = torch.linalg.vector_norm(torch.stack([parameter.grad.detach().norm() for parameter in parameters_with_grad]))
         if not torch.isfinite(grad_norm):
             raise FloatingPointError("DMPO produced non-finite gradients")
-        
+
         if self.clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(parameters_with_grad, self.clip_grad_norm)
         self.optimizer.step()
@@ -296,19 +300,15 @@ class DMPOTrainer:
         weights = torch.softmax(log_weights.float(), dim=0)
         return float(1.0 / (weights.square().sum() * weights.numel()))
 
-    def finetune(
-        self,
-        dataset: Dataset[DMPOSample],
-        steps: int | None = None,
-        debug: bool = False,
-    ) -> list[float] | float:
-        breakpoint()
+    def finetune(self, dataset: DMPOSample, steps: int | None = None, debug: bool = False) -> list[float] | float:
+        batch_size = self.config.batch_size
         indices = np.random.permutation(len(dataset))
         if steps is not None:
-            indices = indices[:steps]
-        
-        losses = []
-        for index in indices:
-            print(index)
-            losses.append(self.train_step(dataset[int(index)]))
+            indices = indices[: steps * batch_size]
+
+        losses: list[float] = []
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start : start + batch_size]
+            batch = DMPOSample.concat([dataset[int(index)] for index in batch_indices])
+            losses.append(self.train_step(batch))
         return losses if debug else float(np.mean(losses))
