@@ -23,11 +23,13 @@ class MOReward(Reward[D]):
 class CombinedRewards(MOReward[D]):
     """Concatenate outputs from several multi-objective rewards."""
 
-    def __init__(self, rewards: Sequence[MOReward[D]]):
+    def __init__(self, rewards: Sequence[MOReward[D]], ref_point: torch.Tensor | None = None):
         self.rewards = list(rewards)
+        if ref_point is None:
+            ref_point = torch.stack([reward.ref_point for reward in self.rewards])
         super().__init__(
-            num_rew=sum(reward.num_rew for reward in self.rewards),
-            ref_point=torch.cat([reward.ref_point for reward in self.rewards]),
+            num_rew=sum([reward.num_rew if isinstance(reward, MOReward) else 1 for reward in self.rewards]),
+            ref_point=ref_point,
          )
 
     def __call__(self, sample: D, latent: D, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:

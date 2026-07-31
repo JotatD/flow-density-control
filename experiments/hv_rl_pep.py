@@ -13,11 +13,13 @@ import optuna
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from genexp.mo.utils import plot_clipped_values
-from genexp.trainers.dmpo import DMPOTrainer
+from genexp.trainers.hv_discrete_rl import HVDiscreteRL
 from genexp.wandb_log import WandbLogger
 from peptidesgym import DiscreteEnvironment, PeptuneModel
-from peptidesgym.rewards import PermeabilityReward
+from peptidesgym.rewards import PermeabilityReward, HemolysisReward
+from genexp.mo.base import CombinedRewards
+from genexp.mo.utils import HVComputer, plot_objective_points, plot_clipped_values
+import traceback
 import pickle as pkl
 
 def parse_args() -> argparse.Namespace:
@@ -39,17 +41,23 @@ def seed_everything(seed: int) -> None:
 
 @torch.no_grad()
 def evaluate(
-    trainer: DMPOTrainer,
+    trainer: HVDiscreteRL,
     num_samples: int,
     batch_size: int,
+    reward: CombinedRewards
 ) -> torch.Tensor:
     rewards = []
     trainer.fine_model.eval()
+    env_model = trainer.env.base_model
+    env_reward = trainer.env.reward
+    trainer.env.base_model = trainer.fine_model
+    trainer.env.reward = reward
     for start in range(0, num_samples, batch_size):
         current_batch_size = min(batch_size, num_samples - start)
         env_sample = trainer.env.sample(current_batch_size, pbar=False)
         rewards.append(env_sample.rewards.detach().float().cpu())
-
+    trainer.env.base_model = env_model
+    trainer.env.reward = env_reward 
     result = torch.cat(rewards)
     return result
 
@@ -69,76 +77,112 @@ def main(config: DictConfig) -> float:
         run_name=config.run_name,
     )
     global_step = log.set_step_metric(0, "global_step")
+    md_iteration = log.set_step_metric(0, "md_iteration")
     loss = log.watch("loss", "global_step")
-    grad_norm = log.watch("grad_norm", "global_step")
-    mean_reward = log.watch("mean_reward", "global_step")
-    mean_lrmp = log.watch("mean_log_reference_minus_policy", "global_step")
-    sample_eff = log.watch("effective_sample_size", "global_step")
-    data_img = log.set_image("data_image", "global_step")
     eval_img = log.set_image("eval_image", "global_step")
     reward_med = log.watch("reward_median", "global_step")
+    full_hv = log.watch("full_hypervolume", "global_step")
+    n_hv = log.watch("n_hypervolume", "global_step")
+    dtst_img = log.set_image("dataset_image", "global_step")
+    ambient = np.load('assets/pep_200/data/obj.npy')
+    
 
+    #try
+    print(f"Loading PepTune reference and policy models on {device}")
+    base_model = PeptuneModel(config=config, device=device).eval()
+    fine_model = PeptuneModel(config=config, device=device)
+
+    hv_computer = HVComputer(ref_point=torch.tensor([-10.0, 0.0]), num_rew=2)
+    rewards = [PermeabilityReward(device=device), HemolysisReward(device=device)]
+    reward = CombinedRewards(rewards=rewards, ref_point=torch.tensor([-10.0, 0.0]))
+    environment = DiscreteEnvironment(
+        base_model=fine_model,
+        reward=reward,
+        discretization_steps=int(config.sampling.steps),
+    )
+    trainer = HVDiscreteRL(
+        config=config,
+        env=environment,
+        base_model=base_model,
+        fine_model=fine_model,
+        device=device,
+        verbose=True,
+    )
+
+    dataset = None
+    max_epochs = int(config.trainer.max_epochs)
+    resample_every = int(config.resample_every)
     try:
-        print(f"Loading PepTune reference and policy models on {device}")
-        base_model = PeptuneModel(config=config, device=device).eval()
-        fine_model = PeptuneModel(config=config, device=device)
+        for _ in range(config.num_md_iterations):
+            md_iteration += 1
+            for epoch in range(max_epochs):
+                global_step += 1
+                print(f"Epoch {epoch + 1}/{max_epochs} of MD iteration {md_iteration.val}")
+                if dataset is None or epoch % resample_every == 0:
+                    print(f"Sampling new dataset for MD iteration {md_iteration.val}, epoch {epoch + 1}")
+                    dataset = trainer.generate_dataset()
+                    dtst_img.val = plot_clipped_values(low=-1, high=80, values=dataset.rewards.detach().cpu().numpy())
 
-        permeability = PermeabilityReward(device=device)
-        environment = DiscreteEnvironment(
-            base_model=fine_model,
-            reward=permeability,
-            discretization_steps=int(config.sampling.steps),
-        )
-        trainer = DMPOTrainer(
-            config=config,
-            env=environment,
-            fine_model=fine_model,
-            base_model=base_model,
-            device=device,
-            verbose=True,
-        )
+                    rewards = evaluate(trainer, reward=reward, num_samples=config.num_eval_samples, batch_size=config.dmpo.batch_size)
+                    
+                    eval_img.val = plot_objective_points(ambient=ambient, special=rewards)
+                    reward_med.val = np.median(rewards.numpy())
+                    full_hv.val = hv_computer(rewards.reshape(1, -1, 2)).item()
+                    n_hv.val = hv_computer(rewards.reshape(-1, config.n, 2)).mean().item()
+                loss.val = trainer.finetune(dataset)
 
-        dataset = None
-        max_epochs = int(config.trainer.max_epochs)
-        resample_every = int(config.resample_every)
-        for epoch in range(max_epochs):
-            print(f"Epoch/global_step {epoch + 1}/{max_epochs}: training with DMPO")
-            if dataset is None or epoch % resample_every == 0:
-                print(f"Epoch {epoch + 1}/{max_epochs}: generating fresh rollouts")
-                dataset = trainer.generate_dataset()
-                dtst_rews = dataset.rewards.detach().cpu().numpy()
-                data_img.val = plot_clipped_values(high=0.0, low=-10.0, values=dtst_rews)
 
-            loss.val = trainer.finetune(dataset)
-            global_step += 1
-            grad_norm.val = trainer.last_metrics["grad_norm"]
-            mean_reward.val = trainer.last_metrics["mean_reward"]
-            mean_lrmp.val = trainer.last_metrics["mean_log_reference_minus_policy"]
-            sample_eff.val = trainer.last_metrics["effective_sample_size"]
-
-            rewards = evaluate(trainer, num_samples=int(config.num_eval_samples), batch_size=int(config.batch_size))
-            eval_img.val = plot_clipped_values(high=0.0, low=-10.0, values=rewards.numpy())
-            reward_med.val = np.median(rewards.numpy())
-
-        torch.save(trainer.fine_model.state_dict(), output_path / "final_model.pt")
+            trainer.update_base_model()
+            torch.save(trainer.fine_model.state_dict(), output_path / "final_model.pt")
         return rewards.mean().item()
     except Exception as e:
+        traceback.print_exc()
         print(f"An error occurred: {e}")
-        raise e
     finally:
         with open(output_path / "last_dataset.pkl", "wb") as f:
             pkl.dump(dataset, f)
+        torch.save(trainer.fine_model.state_dict(), output_path / "finally_final_model.pt")
         log.finish()
 
 
 def optuna_entry(trial: optuna.Trial) -> float:
     args = parse_args()
+    x = 32
     config = {
+        "n": 4,
+        "num_md_iterations": 15,
+        "temperature": 1e-5,
+        "num_lambda": 400,
+        "num_p_nm1": 256,
+        "sample_p_nm1_batch_size": 40,
+        "vol_samples": 256,
         "noise": {
             "type": "loglinear",
             "sigma_min": 1e-4,
             "sigma_max": 20,
             "state_dependent": True,
+        },
+        "lmbda": 100,
+        "dmpo": {
+            "lr": trial.suggest_categorical("lr", [1e-4]),
+            "batch_size": 40,
+            "alpha": trial.suggest_categorical("alpha", [5e-3]),
+            "importance_coefficient": 1.0,
+            "clip_grad_norm": 2.0,
+            "num_replicates": 16, #at replication time, the num_samples size is multiplied by this number
+            "mask_eps": 1e-3,
+            "centering": True,
+            "num_samples": 100, # num samples in the dataset
+        },
+        "sampling": {
+            "predictor": "ddpm_cache",
+            "seq_length": 200, #important parameter
+            "sampling_eps": 1e-3,
+            "steps": 128, #important
+            "noise_removal": True,
+        },
+        "trainer": {
+            "max_epochs": 32,
         },
         "mode": "train",
         "diffusion": "absorbing_state",
@@ -150,24 +194,8 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "subs_masking": False,
         "seed": 42,
         "checkpoint": "../peptidesgym/checkpoints/peptune-pretrained.ckpt",
-        "lr": trial.suggest_categorical("lr", [1e-4]),
-        "batch_size": 40,
-        "num_replicates": 16, #at replication time, the num_samples size is multiplied by this number
-        "resample_every": trial.suggest_categorical("resample_every", [1, 4, 8]),
-        "alpha": trial.suggest_categorical("alpha", [5e-5, 5e-3, 5e-1]),
-        "importance_coefficient": 1.0,
-        "clip_grad_norm": 2.0,
-        "mask_eps": 1e-3,
-        "centering": True,
+        "resample_every": trial.suggest_categorical("resample_every", [8]),
         "num_eval_samples": 64,
-        "sampling": {
-            "predictor": "ddpm_cache",
-            "num_samples": 100, # num samples in the dataset
-            "sampling_eps": 1e-3,
-            "steps": 4,
-            "seq_length": 200,
-            "noise_removal": True,
-        },
         "training": {
             "sampling_eps": 1e-3,
         },
@@ -184,9 +212,6 @@ def optuna_entry(trial: optuna.Trial) -> float:
             "n_layers": 8,
             "n_heads": 8,
             "max_position_embeddings": 1035,
-        },
-        "trainer": {
-            "max_epochs": 100,
         },
         "wandb": args.wandb,
         "project_name": trial.study.study_name,

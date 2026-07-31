@@ -5,13 +5,15 @@ from pathlib import Path
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 
 def plot_objective_points(
-    ambient: torch.Tensor,
-    special: torch.Tensor | None):
-    ambient = ambient.detach().cpu().numpy()
+    ambient: torch.Tensor | np.ndarray,
+    special: torch.Tensor | np.ndarray | None):
+    if isinstance(ambient, torch.Tensor):
+        ambient = ambient.detach().cpu().numpy()
+    if special is not None and isinstance(special, torch.Tensor):
+        special = special.detach().cpu().numpy()
 
     assert ambient.ndim == 2 and ambient.shape[1] == 2, f"Expected ambient objective points with shape (batch, 2); got {ambient.shape}"
     if special is not None:
-        special = special.detach().cpu().numpy()
         assert special.ndim == 2 and special.shape[1] == 2, f"Expected special objective points with shape (batch, 2); got {special.shape}"
 
     fig, ax = plt.subplots(figsize=(7, 6))

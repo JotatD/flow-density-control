@@ -95,6 +95,7 @@ def loss_wdce(
     eps: float = 1e-3,
     centering: bool = False,
     uniform_weights: bool = False,
+    batch_size: int
 ) -> torch.Tensor:
     """Weighted denoising cross entropy used by DMPO.
 
@@ -113,23 +114,27 @@ def loss_wdce(
             f"log_rnd must have shape ({tokens.shape[0]},), got {tuple(log_rnd.shape)}"
         )
 
-    batch_size = tokens.shape[0]
+    batch = tokens.repeat_interleave(num_replicates, dim=0)
+    full_size = batch.shape[0]
     if uniform_weights:
-        weights = torch.ones_like(log_rnd)
+        weights = torch.ones_like(log_rnd) / tokens.shape[0]
     else:
-        # Multiplication by B gives mean weight one and keeps loss scales stable.
-        weights = torch.softmax(log_rnd.detach(), dim=0) * batch_size
+        weights = torch.softmax(log_rnd.detach(), dim=0)
     if centering:
         weights = weights - weights.mean()
 
-    batch = tokens.repeat_interleave(num_replicates, dim=0)
     weights = weights.repeat_interleave(num_replicates)
     mask_probability = torch.rand(batch.shape[0], device=batch.device)
     mask_probability = mask_probability.clamp(min=eps, max=1 - eps)
     masked = torch.rand(batch.shape, device=batch.device) < mask_probability[:, None]
     perturbed = torch.where(masked, policy_model.mask_index, batch)
-
-    log_probs = policy_model(DDTensor(perturbed), mask_probability).data
+    log_probs = []
+    for start in range(0, full_size, batch_size):
+        end = min(start + batch_size, full_size)
+        pertuber_batch = perturbed[start:end]
+        lp = policy_model(DDTensor(pertuber_batch), mask_probability[start:end])
+        log_probs.append(lp.data)
+    log_probs = torch.cat(log_probs, dim=0)
     selected_log_probs = log_probs.gather(-1, batch.unsqueeze(-1)).squeeze(-1)
     token_nll = -(selected_log_probs * masked.to(selected_log_probs.dtype)).sum(dim=-1)
     per_example_loss = token_nll / mask_probability
@@ -160,7 +165,6 @@ class DMPOTrainer:
         if fine_model is base_model:
             raise ValueError("fine_model and base_model must be distinct model instances")
         self.config = config
-        self.sampling_config = config.sampling
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.verbose = verbose
         self.clip_grad_norm = config.get("clip_grad_norm", 2.0)
@@ -190,7 +194,7 @@ class DMPOTrainer:
 
     def generate_dataset(self) -> DMPOSample:
         """Collect rollout batches and compute detached importance weights."""
-        num_samples = int(self.sampling_config.num_samples)
+        num_samples = int(self.config.num_samples)
         batch_size = int(self.config.batch_size)
         if num_samples < 1:
             raise ValueError("sampling.num_samples must be positive")
@@ -272,6 +276,7 @@ class DMPOTrainer:
             num_replicates=self.config.num_replicates,
             eps=self.config.get("mask_eps", 1e-3),
             centering=self.config.get("centering", False),
+            batch_size=self.config.batch_size,
         )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite DMPO loss: {loss.item()}")
