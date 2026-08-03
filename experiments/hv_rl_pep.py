@@ -1,26 +1,27 @@
-#!/usr/bin/env python
 """Tune PepTune with DMPO using final permeability as the Optuna objective."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import pickle as pkl
 import random
+import traceback
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import optuna
 import torch
 from omegaconf import DictConfig, OmegaConf
+from peptidesgym import DiscreteEnvironment, PeptuneModel
+from peptidesgym.rewards import HemolysisReward, PermeabilityReward
 
+from genexp.mo.base import CombinedRewards
+from genexp.mo.utils import HVComputer, plot_clipped_values, plot_objective_points
 from genexp.trainers.hv_discrete_rl import HVDiscreteRL
 from genexp.wandb_log import WandbLogger
-from peptidesgym import DiscreteEnvironment, PeptuneModel
-from peptidesgym.rewards import PermeabilityReward, HemolysisReward
-from genexp.mo.base import CombinedRewards
-from genexp.mo.utils import HVComputer, plot_objective_points, plot_clipped_values
-import traceback
-import pickle as pkl
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune PepTune with DMPO and final permeability.")
@@ -38,6 +39,48 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+class CheckpointQueue:
+    def __init__(self, max_size: int, name_prefix: str, save_dir: Path):
+        if max_size < 1:
+            raise ValueError("max_size must be at least 1")
+
+        self.max_size = max_size
+        self.name_prefix = name_prefix
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _checkpoint_path(self, index: int, extension: str) -> Path:
+        suffix = "last" if index == 0 else f"last_minus_{index}"
+        return self.save_dir / f"{self.name_prefix}_{suffix}.{extension}"
+
+    def add(self, obj: torch.nn.Module | Any) -> Path:
+        extension = "pt" if isinstance(obj, torch.nn.Module) else "pkl"
+
+        # Remove the oldest checkpoint if the queue is full.
+        for ext in ("pt", "pkl"):
+            oldest = self._checkpoint_path(self.max_size - 1, ext)
+            oldest.unlink(missing_ok=True)
+
+        # Shift existing checkpoints backward:
+        # last -> last_minus_1, last_minus_1 -> last_minus_2, etc.
+        for index in range(self.max_size - 2, -1, -1):
+            for ext in ("pt", "pkl"):
+                source = self._checkpoint_path(index, ext)
+
+                if source.exists():
+                    destination = self._checkpoint_path(index + 1, ext)
+                    source.replace(destination)
+
+        checkpoint_path = self._checkpoint_path(0, extension)
+
+        if isinstance(obj, torch.nn.Module):
+            torch.save(obj.state_dict(), checkpoint_path)
+        else:
+            with checkpoint_path.open("wb") as file:
+                pkl.dump(obj, file)
+
+        return checkpoint_path
 
 @torch.no_grad()
 def evaluate(
@@ -108,7 +151,13 @@ def main(config: DictConfig) -> float:
         device=device,
         verbose=True,
     )
-
+    
+    inner_ckpt_queue = CheckpointQueue(max_size=3, name_prefix="peptune", save_dir=output_path)
+    dataset_ckpt_queue = CheckpointQueue(max_size=3, name_prefix="dataset", save_dir=output_path)
+    outer_ckpt_queue = CheckpointQueue(max_size=2, name_prefix="outer", save_dir=output_path)
+    
+    # last_model_path = Path('/shared/home/juan.guevara/Code/flow-density-control/output/first_hv_pep/trial_0/final_model.pt')
+    # fine_model.load_state_dict(torch.load(last_model_path, map_location=device))
     dataset = None
     max_epochs = int(config.trainer.max_epochs)
     resample_every = int(config.resample_every)
@@ -129,17 +178,20 @@ def main(config: DictConfig) -> float:
                     reward_med.val = np.median(rewards.numpy())
                     full_hv.val = hv_computer(rewards.reshape(1, -1, 2)).item()
                     n_hv.val = hv_computer(rewards.reshape(-1, config.n, 2)).mean().item()
+                    
+                    dataset_ckpt_queue.add(dataset)
+                    
                 loss.val = trainer.finetune(dataset)
-
-
+                inner_ckpt_queue.add(trainer.fine_model)
             trainer.update_base_model()
+            outer_ckpt_queue.add(trainer.base_model)
             torch.save(trainer.fine_model.state_dict(), output_path / "final_model.pt")
         return rewards.mean().item()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         print(f"An error occurred: {e}")
     finally:
-        with open(output_path / "last_dataset.pkl", "wb") as f:
+        with open(output_path / "lasty_last_dataset.pkl", "wb") as f:
             pkl.dump(dataset, f)
         torch.save(trainer.fine_model.state_dict(), output_path / "finally_final_model.pt")
         log.finish()
@@ -147,15 +199,15 @@ def main(config: DictConfig) -> float:
 
 def optuna_entry(trial: optuna.Trial) -> float:
     args = parse_args()
-    x = 32
+    x = 1
     config = {
         "n": 4,
         "num_md_iterations": 15,
         "temperature": 1e-5,
         "num_lambda": 400,
-        "num_p_nm1": 256,
+        "num_p_nm1": 256 // x,
         "sample_p_nm1_batch_size": 40,
-        "vol_samples": 256,
+        "vol_samples": 256 // x,
         "noise": {
             "type": "loglinear",
             "sigma_min": 1e-4,
@@ -172,13 +224,13 @@ def optuna_entry(trial: optuna.Trial) -> float:
             "num_replicates": 16, #at replication time, the num_samples size is multiplied by this number
             "mask_eps": 1e-3,
             "centering": True,
-            "num_samples": 100, # num samples in the dataset
+            "num_samples": 100 // x, # num samples in the dataset
         },
         "sampling": {
             "predictor": "ddpm_cache",
-            "seq_length": 200, #important parameter
+            "seq_length": 200 // x, #important parameter
             "sampling_eps": 1e-3,
-            "steps": 128, #important
+            "steps": 128 // x, #important
             "noise_removal": True,
         },
         "trainer": {
@@ -227,7 +279,7 @@ if __name__ == "__main__":
         study_name=cli_args.name,
         sampler=optuna.samplers.BruteForceSampler(seed=cli_args.optuna_seed),
         direction="maximize",
-        storage=f"sqlite:///optuna_store.db",
+        storage="sqlite:///optuna_store.db",
         load_if_exists=True,
     )
     study.optimize(optuna_entry, n_trials=9)
