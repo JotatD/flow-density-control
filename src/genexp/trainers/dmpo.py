@@ -194,6 +194,7 @@ class DMPOTrainer:
 
     def generate_dataset(self) -> DMPOSample:
         """Collect rollout batches and compute detached importance weights."""
+        self.env.base_model.eval()
         num_samples = int(self.config.num_samples)
         batch_size = int(self.config.batch_size)
         if num_samples < 1:
@@ -215,6 +216,7 @@ class DMPOTrainer:
     @torch.no_grad()
     def solve(self, env_sample: DiscreteSample[DDTensor]) -> DMPOSample:
         """Compute exact discretized trajectory likelihood ratios."""
+        self.base_model.eval()
         samples = env_sample.latent
         trajectory = env_sample.trajectory
         log_ps = env_sample.log_p

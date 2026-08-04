@@ -15,10 +15,9 @@ import optuna
 import torch
 from omegaconf import DictConfig, OmegaConf
 from peptidesgym import DiscreteEnvironment, PeptuneModel
-from peptidesgym.rewards import HemolysisReward, PermeabilityReward
 
-from genexp.mo.base import CombinedRewards
-from genexp.mo.utils import HVComputer, plot_clipped_values, plot_objective_points
+from genexp.mo.mo_pep import PeptideMOReward
+from genexp.mo.utils import HVComputer, plot_clipped_values
 from genexp.trainers.hv_discrete_rl import HVDiscreteRL
 from genexp.wandb_log import WandbLogger
 
@@ -87,7 +86,7 @@ def evaluate(
     trainer: HVDiscreteRL,
     num_samples: int,
     batch_size: int,
-    reward: CombinedRewards
+    reward: PeptideMOReward,
 ) -> torch.Tensor:
     rewards = []
     trainer.fine_model.eval()
@@ -103,6 +102,32 @@ def evaluate(
     trainer.env.reward = env_reward 
     result = torch.cat(rewards)
     return result
+
+
+def compute_eval_hypervolumes(
+    rewards: torch.Tensor,
+    group_size: int,
+    reward: PeptideMOReward,
+    hv_computer: HVComputer,
+) -> tuple[float, float]:
+    """Compute full and grouped hypervolumes from the available rewards."""
+    if rewards.ndim != 2 or rewards.shape[1] != reward.num_rew:
+        raise ValueError(
+            f"Expected rewards with shape (num_samples, {reward.num_rew}), got {tuple(rewards.shape)}"
+        )
+    if group_size < 1:
+        raise ValueError("group_size must be at least 1")
+
+    num_grouped_samples = (rewards.shape[0] // group_size) * group_size
+    if num_grouped_samples == 0:
+        raise ValueError(
+            f"Need at least {group_size} reward samples to compute grouped hypervolume; got {rewards.shape[0]}"
+        )
+
+    full_hv = hv_computer(rewards.unsqueeze(0)).item()
+    grouped_rewards = rewards[:num_grouped_samples].reshape(-1, group_size, reward.num_rew)
+    grouped_hv = hv_computer(grouped_rewards).mean().item()
+    return full_hv, grouped_hv
 
 
 def main(config: DictConfig) -> float:
@@ -122,22 +147,23 @@ def main(config: DictConfig) -> float:
     global_step = log.set_step_metric(0, "global_step")
     md_iteration = log.set_step_metric(0, "md_iteration")
     loss = log.watch("loss", "global_step")
-    eval_img = log.set_image("eval_image", "global_step")
-    reward_med = log.watch("reward_median", "global_step")
     full_hv = log.watch("full_hypervolume", "global_step")
     n_hv = log.watch("n_hypervolume", "global_step")
     dtst_img = log.set_image("dataset_image", "global_step")
-    ambient = np.load('assets/pep_200/data/obj.npy')
-    
+    # ambient = np.load('assets/pep_200/data/obj.npy')
+
 
     #try
     print(f"Loading PepTune reference and policy models on {device}")
     base_model = PeptuneModel(config=config, device=device).eval()
     fine_model = PeptuneModel(config=config, device=device)
 
-    hv_computer = HVComputer(ref_point=torch.tensor([-10.0, 0.0]), num_rew=2)
-    rewards = [PermeabilityReward(device=device), HemolysisReward(device=device)]
-    reward = CombinedRewards(rewards=rewards, ref_point=torch.tensor([-10.0, 0.0]))
+    reward = PeptideMOReward(
+        reward_names=["permeability", "hemolysis"],
+        zero_invalid=True,
+        device=device,
+    )
+    hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     environment = DiscreteEnvironment(
         base_model=fine_model,
         reward=reward,
@@ -152,6 +178,8 @@ def main(config: DictConfig) -> float:
         verbose=True,
     )
     
+    reward_trackers = {name: log.watch(f"{name}", "global_step") for name in reward.reward_names}
+
     inner_ckpt_queue = CheckpointQueue(max_size=3, name_prefix="peptune", save_dir=output_path)
     dataset_ckpt_queue = CheckpointQueue(max_size=3, name_prefix="dataset", save_dir=output_path)
     outer_ckpt_queue = CheckpointQueue(max_size=2, name_prefix="outer", save_dir=output_path)
@@ -173,11 +201,9 @@ def main(config: DictConfig) -> float:
                     dtst_img.val = plot_clipped_values(low=-1, high=80, values=dataset.rewards.detach().cpu().numpy())
 
                     rewards = evaluate(trainer, reward=reward, num_samples=config.num_eval_samples, batch_size=config.dmpo.batch_size)
-                    
-                    eval_img.val = plot_objective_points(ambient=ambient, special=rewards)
-                    reward_med.val = np.median(rewards.numpy())
-                    full_hv.val = hv_computer(rewards.reshape(1, -1, 2)).item()
-                    n_hv.val = hv_computer(rewards.reshape(-1, config.n, 2)).mean().item()
+                    for i, name in enumerate(reward.reward_names):
+                        reward_trackers[name].val = rewards[:, i].mean().item()
+                    full_hv.val, n_hv.val = compute_eval_hypervolumes(rewards=rewards, group_size=int(config.n), reward=reward, hv_computer=hv_computer)
                     
                     dataset_ckpt_queue.add(dataset)
                     
@@ -214,23 +240,23 @@ def optuna_entry(trial: optuna.Trial) -> float:
             "sigma_max": 20,
             "state_dependent": True,
         },
-        "lmbda": 100,
+        "lmbda": 1,
         "dmpo": {
             "lr": trial.suggest_categorical("lr", [1e-4]),
             "batch_size": 40,
-            "alpha": trial.suggest_categorical("alpha", [5e-3]),
+            "alpha": trial.suggest_categorical("alpha", [0.1]),
             "importance_coefficient": 1.0,
-            "clip_grad_norm": 2.0,
-            "num_replicates": 16, #at replication time, the num_samples size is multiplied by this number
+            "clip_grad_norm": -1.0,
+            "num_replicates": 16,  # at replication time, the num_samples size is multiplied by this number
             "mask_eps": 1e-3,
-            "centering": True,
-            "num_samples": 100 // x, # num samples in the dataset
+            "centering": False,
+            "num_samples": 100 // x,  # num samples in the dataset
         },
         "sampling": {
             "predictor": "ddpm_cache",
-            "seq_length": 200 // x, #important parameter
+            "seq_length": 200 // x,  # important parameter
             "sampling_eps": 1e-3,
-            "steps": 128 // x, #important
+            "steps": 128 // x,  # important
             "noise_removal": True,
         },
         "trainer": {
@@ -245,7 +271,7 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "T": 0,
         "subs_masking": False,
         "seed": 42,
-        "checkpoint": "../peptidesgym/checkpoints/peptune-pretrained.ckpt",
+        "checkpoint": "/home/juan.guevara/test/peptune/peptidesgym/checkpoints/peptune-pretrained.ckpt",
         "resample_every": trial.suggest_categorical("resample_every", [8]),
         "num_eval_samples": 64,
         "training": {
