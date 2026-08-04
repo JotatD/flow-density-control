@@ -87,21 +87,23 @@ def evaluate(
     num_samples: int,
     batch_size: int,
     reward: PeptideMOReward,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, float]:
     rewards = []
     trainer.fine_model.eval()
     env_model = trainer.env.base_model
     env_reward = trainer.env.reward
     trainer.env.base_model = trainer.fine_model
     trainer.env.reward = reward
+    valids = 0
     for start in range(0, num_samples, batch_size):
         current_batch_size = min(batch_size, num_samples - start)
         env_sample = trainer.env.sample(current_batch_size, pbar=False)
         rewards.append(env_sample.rewards.detach().float().cpu())
+        valids += env_sample.info["valids"].sum().item()
     trainer.env.base_model = env_model
     trainer.env.reward = env_reward 
     result = torch.cat(rewards)
-    return result
+    return result, valids / num_samples
 
 
 def compute_eval_hypervolumes(
@@ -131,8 +133,6 @@ def compute_eval_hypervolumes(
 
 
 def main(config: DictConfig) -> float:
-    root = Path(__file__).resolve().parents[1]
-    torch.hub.set_dir(str(root / ".torch-cache" / "hub"))
     seed_everything(int(config.seed))
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     output_path = Path(f"output/{config.project_name}/{config.run_name}")
@@ -150,6 +150,7 @@ def main(config: DictConfig) -> float:
     full_hv = log.watch("full_hypervolume", "global_step")
     n_hv = log.watch("n_hypervolume", "global_step")
     dtst_img = log.set_image("dataset_image", "global_step")
+    valid_rate = log.watch("valid_rate", "global_step")
     # ambient = np.load('assets/pep_200/data/obj.npy')
 
 
@@ -158,11 +159,21 @@ def main(config: DictConfig) -> float:
     base_model = PeptuneModel(config=config, device=device).eval()
     fine_model = PeptuneModel(config=config, device=device)
 
-    reward = PeptideMOReward(
-        reward_names=["permeability", "hemolysis"],
-        zero_invalid=True,
-        device=device,
-    )
+    rewards = [
+        PeptideMOReward(
+            reward_names=["solubility", "hemolysis", "nonfouling", "permeability", "binding_affinity"],
+            zero_invalid=True,
+            device=device,
+            protein_sequence="MMDQARSAFSNLFGGEPLSYTRFSLARQVDGDNSHVEMKLAVDEEENADNNTKANVTKPKRCSGSICYGTIAVIVFFLIGFMIGYLGYCKGVEPKTECERLAGTESPVREEPGEDFPAARRLYWDDLKRKLSEKLDSTDFTGTIKLLNENSYVPREAGSQKDENLALYVENQFREFKLSKVWRDQHFVKIQVKDSAQNSVIIVDKNGRLVYLVENPGGYVAYSKAATVTGKLVHANFGTKKDFEDLYTPVNGSIVIVRAGKITFAEKVANAESLNAIGVLIYMDQTKFPIVNAELSFFGHAHLGTGDPYTPGFPSFNHTQFPPSRSSGLPNIPVQTISRAAAEKLFGNMEGDCPSDWKTDSTCRMVTSESKNVKLTVSNVLKEIKILNIFGVIKGFVEPDHYVVVGAQRDAWGPGAAKSGVGTALLLKLAQMFSDMVLKDGFQPSRSIIFASWSAGDFGSVGATEWLEGYLSSLHLKAFTYINLDKAVLGTSNFKVSASPLLYTLIEKTMQNVKHPVTGQFLYQDSNWASKVEKLTLDNAAFPFLAYSGIPAVSFCFCEDTDYPYLGTTMDTYKELIERIPELNKVARAAAEVAGQFVIKLTHDVELNLDYERYNSQLLSFVRDLNQYRADIKEMGLSLQWLYSARGDFFRATSRLTTDFGNAEKTDRFVMKKLNDRVMRVEYHFLSPYVSPKESPFRHVFWGSGSHTLPALLENLKLRKQNNGAFNETLFRNQLALATWTIQGAANALSGDVWDIDNEF",
+        ),
+        PeptideMOReward(
+            reward_names=["solubility", "hemolysis", "nonfouling", "permeability", "binding_affinity", "validity"],
+            zero_invalid=False,
+            device=device,
+            protein_sequence="MMDQARSAFSNLFGGEPLSYTRFSLARQVDGDNSHVEMKLAVDEEENADNNTKANVTKPKRCSGSICYGTIAVIVFFLIGFMIGYLGYCKGVEPKTECERLAGTESPVREEPGEDFPAARRLYWDDLKRKLSEKLDSTDFTGTIKLLNENSYVPREAGSQKDENLALYVENQFREFKLSKVWRDQHFVKIQVKDSAQNSVIIVDKNGRLVYLVENPGGYVAYSKAATVTGKLVHANFGTKKDFEDLYTPVNGSIVIVRAGKITFAEKVANAESLNAIGVLIYMDQTKFPIVNAELSFFGHAHLGTGDPYTPGFPSFNHTQFPPSRSSGLPNIPVQTISRAAAEKLFGNMEGDCPSDWKTDSTCRMVTSESKNVKLTVSNVLKEIKILNIFGVIKGFVEPDHYVVVGAQRDAWGPGAAKSGVGTALLLKLAQMFSDMVLKDGFQPSRSIIFASWSAGDFGSVGATEWLEGYLSSLHLKAFTYINLDKAVLGTSNFKVSASPLLYTLIEKTMQNVKHPVTGQFLYQDSNWASKVEKLTLDNAAFPFLAYSGIPAVSFCFCEDTDYPYLGTTMDTYKELIERIPELNKVARAAAEVAGQFVIKLTHDVELNLDYERYNSQLLSFVRDLNQYRADIKEMGLSLQWLYSARGDFFRATSRLTTDFGNAEKTDRFVMKKLNDRVMRVEYHFLSPYVSPKESPFRHVFWGSGSHTLPALLENLKLRKQNNGAFNETLFRNQLALATWTIQGAANALSGDVWDIDNEF",
+        ),
+    ]
+    reward = rewards[config.reward_index]
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     environment = DiscreteEnvironment(
         base_model=fine_model,
@@ -200,7 +211,7 @@ def main(config: DictConfig) -> float:
                     dataset = trainer.generate_dataset()
                     dtst_img.val = plot_clipped_values(low=-1, high=80, values=dataset.rewards.detach().cpu().numpy())
 
-                    rewards = evaluate(trainer, reward=reward, num_samples=config.num_eval_samples, batch_size=config.dmpo.batch_size)
+                    rewards, valid_rate.val = evaluate(trainer, reward=reward, num_samples=config.num_eval_samples, batch_size=config.dmpo.batch_size)
                     for i, name in enumerate(reward.reward_names):
                         reward_trackers[name].val = rewards[:, i].mean().item()
                     full_hv.val, n_hv.val = compute_eval_hypervolumes(rewards=rewards, group_size=int(config.n), reward=reward, hv_computer=hv_computer)
@@ -225,7 +236,7 @@ def main(config: DictConfig) -> float:
 
 def optuna_entry(trial: optuna.Trial) -> float:
     args = parse_args()
-    x = 1
+    x = 32
     config = {
         "n": 4,
         "num_md_iterations": 15,
@@ -240,11 +251,11 @@ def optuna_entry(trial: optuna.Trial) -> float:
             "sigma_max": 20,
             "state_dependent": True,
         },
-        "lmbda": 1,
+        "lmbda": trial.suggest_categorical("lmbda", [1, 100]),
         "dmpo": {
             "lr": trial.suggest_categorical("lr", [1e-4]),
             "batch_size": 40,
-            "alpha": trial.suggest_categorical("alpha", [0.1]),
+            "alpha": trial.suggest_categorical("alpha", [0.1, 5e-3]),
             "importance_coefficient": 1.0,
             "clip_grad_norm": -1.0,
             "num_replicates": 16,  # at replication time, the num_samples size is multiplied by this number
@@ -294,6 +305,7 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "wandb": args.wandb,
         "project_name": trial.study.study_name,
         "run_name": f"trial_{trial.number}",
+        "reward_index": trial.suggest_categorical("reward_index", [0, 1]),
     }
     resolved = OmegaConf.create(config)
     return main(resolved)
@@ -308,4 +320,4 @@ if __name__ == "__main__":
         storage="sqlite:///optuna_store.db",
         load_if_exists=True,
     )
-    study.optimize(optuna_entry, n_trials=9)
+    study.optimize(optuna_entry, n_trials=8)
