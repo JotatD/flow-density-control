@@ -78,6 +78,7 @@ class HVComputer:
     def compute_hypervolume_fast_2d(self, objectives: torch.Tensor) -> torch.Tensor:
         orig = objectives.shape[:-2]
         y = objectives.reshape(-1, objectives.shape[-2], 2)
+        ref_point = self.ref_point.to(device=y.device, dtype=y.dtype)
 
         # Sort by first objective ascending
         x0, idx = torch.sort(y[..., 0], dim=-1)
@@ -86,30 +87,30 @@ class HVComputer:
         # Suffix max on second objective to handle dominated points
         x1_sufmax = torch.flip(torch.cummax(torch.flip(x1, dims=[-1]), dim=-1).values, dims=[-1])
 
-        # Rectangle widths from ref_x and previous x
-        # torch.full_like requires a Python scalar for the fill value; extract it with .item()
-        prev_x0 = torch.cat([torch.full_like(x0[..., :1], self.ref_point[0].item()), x0[..., :-1]], dim=-1)
+        # Points below ref_x cannot contribute. Clamping before computing widths
+        # also prevents such points from inflating the first contributing rectangle.
+        x0 = x0.clamp_min(ref_point[0])
+        prev_x0 = torch.cat([ref_point[0].expand_as(x0[..., :1]), x0[..., :-1]], dim=-1)
         widths = (x0 - prev_x0).clamp_min(0.0)
 
         # Heights above ref_y
-        heights = (x1_sufmax - self.ref_point[1]).clamp_min(0.0)
+        heights = (x1_sufmax - ref_point[1]).clamp_min(0.0)
 
         hv = (widths * heights).sum(dim=-1)
         
         return hv.reshape(orig)
 
     def compute_hypervolume_botorch(self, objectives: torch.Tensor) -> torch.Tensor:
-        hv_computer = Hypervolume(self.ref_point)
-        og_shape = objectives.shape
-        if len(objectives.shape) > 3:
-            k_ = objectives.shape[-1]
-            n_ = objectives.shape[-2] 
-            objectives = objectives.reshape(-1, n_, k_)
-        if len(objectives.shape) == 3:
-            hvs = [hv_computer.compute(rew) for rew in objectives]
-        elif len(objectives.shape) == 2:
-            hvs = [hv_computer.compute(objectives)]
-        return torch.tensor(hvs, device=objectives.device).reshape(og_shape[:-2])
+        orig = objectives.shape[:-2]
+        y = objectives.reshape(
+            -1,
+            objectives.shape[-2],
+            objectives.shape[-1],
+        )
+        ref_point = self.ref_point.to(device=y.device, dtype=y.dtype)
+        hv_computer = Hypervolume(ref_point)
+        hvs = [hv_computer.compute(batch) for batch in y]
+        return objectives.new_tensor(hvs).reshape(orig)
 
 
 def plot_score_density(
