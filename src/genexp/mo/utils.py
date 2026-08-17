@@ -8,6 +8,110 @@ from botorch.utils.multi_objective.hypervolume import Hypervolume
 from matplotlib.ticker import PercentFormatter
 
 
+def calculate_reward_bin_percentages(
+    scores: np.ndarray | torch.Tensor,
+    reward_vectors: np.ndarray | torch.Tensor,
+):
+    if isinstance(scores, torch.Tensor):
+        values = scores.detach().cpu().numpy()
+    else:
+        values = np.asarray(scores)
+
+    if isinstance(reward_vectors, torch.Tensor):
+        bins = reward_vectors.detach().cpu().numpy()
+    else:
+        bins = np.asarray(reward_vectors)
+
+    matches = np.all(
+        values[:, np.newaxis, :] == bins[np.newaxis, :, :],
+        axis=2,
+    )
+    return matches.sum(axis=0) / values.shape[0] * 100.0
+
+
+def plot_reward_bin_progression(
+    percentages_by_epoch: np.ndarray,
+    reward_vectors: np.ndarray | torch.Tensor,
+    plot_path: str | Path,
+    filename: str = "reward_bin_percentages.png",
+):
+    percentages = np.asarray(percentages_by_epoch)
+
+    if isinstance(reward_vectors, torch.Tensor):
+        bins = reward_vectors.detach().cpu().numpy()
+    else:
+        bins = np.asarray(reward_vectors)
+
+    epoch_positions = np.arange(percentages.shape[0])
+    labels = [
+        f"({int(reward[0])}, {int(reward[1])})"
+        for reward in bins
+    ]
+
+    fig, ax = plt.subplots(
+        figsize=(12, 7),
+        constrained_layout=True,
+    )
+
+    if percentages.shape[0] == 1:
+        bottom = 0.0
+        colors = plt.get_cmap("tab10").colors
+        for index, (label, percentage) in enumerate(
+            zip(labels, percentages[0])
+        ):
+            ax.bar(
+                0,
+                percentage,
+                bottom=bottom,
+                width=0.5,
+                label=label,
+                color=colors[index % len(colors)],
+            )
+            bottom += percentage
+        ax.set_xlim(-0.5, 0.5)
+    else:
+        ax.stackplot(
+            epoch_positions,
+            percentages.T,
+            labels=labels,
+            alpha=0.9,
+        )
+        ax.set_xlim(epoch_positions[0], epoch_positions[-1])
+
+    ax.set_ylim(0, 100)
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    ax.set_title("Reward-bin percentages over fine-tuning")
+    ax.set_xlabel("Fine-tuning epoch")
+    ax.set_ylabel("Percentage of evaluation batch")
+
+    tick_interval = max(1, int(np.ceil(percentages.shape[0] / 10)))
+    tick_positions = list(epoch_positions[::tick_interval])
+    if epoch_positions[-1] not in tick_positions:
+        tick_positions.append(epoch_positions[-1])
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        ["Initial" if position == 0 else str(position) for position in tick_positions]
+    )
+    ax.legend(
+        title="Reward vector",
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+    )
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    output_directory = Path(plot_path)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    fig.savefig(
+        output_directory / filename,
+        dpi=300,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+
+    plt.close(fig)
+    return ax
+
+
 def plot_objective_points(
     ambient: torch.Tensor | np.ndarray,
     special: torch.Tensor | np.ndarray | None):

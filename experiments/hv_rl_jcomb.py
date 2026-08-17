@@ -8,7 +8,7 @@ import pickle as pkl
 import random
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, final
 
 import numpy as np
 import optuna
@@ -18,7 +18,13 @@ from peptidesgym import DiscreteEnvironment, JCombModel
 from peptidesgym.rewards import CombinatorialReward
 
 from genexp.mo.base import MOReward
-from genexp.mo.utils import HVComputer, plot_clipped_values, plot_score_density
+from genexp.mo.utils import (
+    HVComputer,
+    calculate_reward_bin_percentages,
+    plot_clipped_values,
+    plot_reward_bin_progression,
+    plot_score_density,
+)
 from genexp.trainers.hv_discrete_rl import HVDiscreteRL
 from genexp.wandb_log import WandbLogger
 
@@ -27,12 +33,26 @@ import datetime
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune PepTune with DMPO and final permeability.")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument("--name", type=str, default="reward_pep_study", help="Optuna study and W&B project name.")
+    parser.add_argument("--name", type=str, default="jcomb2", help="Optuna study and W&B project name.")
     parser.add_argument("--optuna_seed", type=int, default=42, help="Random seed for the Optuna sampler.")
     args = parser.parse_args()
     return args
 
 
+def reward_distribution_score(percentages):
+    p = np.asarray(percentages, dtype=float)
+    p = p / p.sum()
+
+    num_good = len(p) - 1
+    ideal = np.concatenate(
+        [
+            np.full(num_good, 1.0 / num_good),
+            [0.0],
+        ]
+    )
+
+    total_variation = 0.5 * np.abs(p - ideal).sum()
+    return 1.0 - total_variation
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -115,12 +135,14 @@ class CombinatorialMO(CombinatorialReward, MOReward):
         return reward_value, info
 
 def main(config: DictConfig) -> float:
+    print(config, flush=True)
     root = Path(__file__).resolve().parents[1]
     torch.hub.set_dir(str(root / ".torch-cache" / "hub"))
     seed_everything(int(config.seed))
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     output_path = Path(f"output/{config.project_name}/{config.run_name}")
     os.makedirs(output_path, exist_ok=True)
+    config.num_md_iterations = 1000//config.trainer.max_epochs
 
     log = WandbLogger(
         project_name=config.project_name,
@@ -132,10 +154,12 @@ def main(config: DictConfig) -> float:
     md_iteration = log.set_step_metric(0, "md_iteration")
     loss = log.watch("loss", "global_step")
     eval_img = log.set_image("eval_image", "global_step")
+    reward_progress_img = log.set_image("reward_bin_progression", "global_step")
     reward_med = log.watch("reward_median", "global_step")
     full_hv = log.watch("full_hypervolume", "global_step")
     n_hv = log.watch("n_hypervolume", "global_step")
     dtst_img = log.set_image("dataset_image", "global_step")
+    tv = log.watch("1_m_total_variation", "global_step")
     
 
     #try
@@ -164,29 +188,43 @@ def main(config: DictConfig) -> float:
     # dataset_ckpt_queue = CheckpointQueue(max_size=3, name_prefix="dataset", save_dir=output_path)
     # outer_ckpt_queue = CheckpointQueue(max_size=2, name_prefix="outer", save_dir=output_path)
     
-    # last_model_path = Path('/shared/home/juan.guevara/Code/flow-density-control/output/first_hv_pep/trial_0/final_model.pt')
-    # fine_model.load_state_dict(torch.load(last_model_path, map_location=device))
+    last_model_path = Path(
+        "/home/juan.guevara/test/tr-counter/TR2-D2/tr2d2-jcomb/outputs/bounded_uniform_binary32_seed42/pretraining/pretrained_best.ckpt"
+    )
+    fine_model.diffusion_model.load_state_dict(torch.load(last_model_path, map_location=device))
+    base_model.diffusion_model.load_state_dict(torch.load(last_model_path, map_location=device))
     dataset = None
     max_epochs = int(config.trainer.max_epochs)
     resample_every = int(config.resample_every)
+    reward_percentage_history = []
     # try:
     for _ in range(config.num_md_iterations):
         md_iteration += 1
         for epoch in range(max_epochs):
             global_step += 1
-            print(f"Epoch {epoch + 1}/{max_epochs} of MD iteration {md_iteration.val}")
+            print(f"Epoch {epoch + 1}/{max_epochs} of MD iteration {md_iteration.val}", flush=True)
             if dataset is None or epoch % resample_every == 0:
-                print(f"Sampling new dataset for MD iteration {md_iteration.val}, epoch {epoch + 1}")
+                print(f"Sampling new dataset for MD iteration {md_iteration.val}, epoch {epoch + 1}", flush=True)
                 dataset = trainer.generate_dataset()
-                dtst_img.val = plot_clipped_values(low=-1, high=80, values=dataset.rewards.detach().cpu().numpy())
 
             rewards = evaluate(trainer, reward=reward, num_samples=2048, batch_size=2048)
-            
-            eval_img.val = plot_score_density(rewards.numpy(), plot_path=output_path, filename=f"eval_scores_md_{md_iteration.val}_epoch_{epoch + 1}.png")
+
+            should_plot = global_step.val % 100 == 0
+            if should_plot:
+                eval_img.val = plot_score_density(rewards.numpy(), plot_path=output_path, filename=f"eval_scores_md_{md_iteration.val}_epoch_{epoch + 1}.png")
+            pctgs = calculate_reward_bin_percentages(rewards, reward.reward_vectors)
+            tv.val = reward_distribution_score(pctgs)
+            reward_percentage_history.append(pctgs)
+            if should_plot:
+                reward_progress_img.val = plot_reward_bin_progression(
+                    reward_percentage_history,
+                    reward.reward_vectors,
+                    output_path,
+                )
             reward_med.val = np.median(rewards.numpy())
             full_hv.val = hv_computer(rewards.reshape(1, -1, 2)).item()
             n_hv.val = hv_computer(rewards.reshape(-1, config.n, 2)).mean().item()
-            print(f"Median reward: {reward_med.val}, Full hypervolume: {full_hv.val}, N hypervolume: {n_hv.val}")
+            print(f"Median reward: {reward_med.val}, Full hypervolume: {full_hv.val}, N hypervolume: {n_hv.val}", flush=True)
                 
                 #dataset_ckpt_queue.add(dataset)
                 
@@ -195,23 +233,34 @@ def main(config: DictConfig) -> float:
         trainer.update_base_model()
         #outer_ckpt_queue.add(trainer.base_model)
         torch.save(trainer.fine_model.state_dict(), output_path / "final_model.pt")
-    # except Exception as e:  # noqa: BLE001
-    #     traceback.print_exc()
-    #     print(f"An error occurred: {e}")
-    # finally:
-    #     with open(output_path / "lasty_last_dataset.pkl", "wb") as f:
-    #         pkl.dump(dataset, f)
-    #     torch.save(trainer.fine_model.state_dict(), output_path / "finally_final_model.pt")
-    #     log.finish()
-    return rewards.mean().item()
+
+    final_rewards = evaluate(
+        trainer,
+        reward=reward,
+        num_samples=2048,
+        batch_size=2048,
+    )
+    pctgs = calculate_reward_bin_percentages(final_rewards, reward.reward_vectors)
+    print(f"Final reward percentages: {pctgs}", flush=True)
+    reward_percentage_history.append(pctgs)
+    tv.val = reward_distribution_score(pctgs)
+    reward_progress_img.val = plot_reward_bin_progression(
+        reward_percentage_history,
+        reward.reward_vectors,
+        output_path,
+    )
+    eval_img.val = plot_score_density(
+        final_rewards.numpy(), plot_path=output_path, filename=f"eval_scores_md_{md_iteration.val}_epoch_{epoch + 1}.png"
+    )
+    log.finish()
+    return tv.val
 
 
 def optuna_entry(trial: optuna.Trial) -> float:
     args = parse_args()
     x = 1
     config = {
-        "n": 4,
-        "num_md_iterations": 15,
+        "n": trial.suggest_categorical("n", [4, 8, 16, 32]),
         "temperature": 1e-5,
         "num_lambda": 400,
         "num_p_nm1": 256 // x,
@@ -219,53 +268,64 @@ def optuna_entry(trial: optuna.Trial) -> float:
         "vol_samples": 256 // x,
         "noise": {
             "type": "loglinear",
-            # "sigma_min": 1e-4,
-            # "sigma_max": 20,
-            # "state_dependent": True,
         },
-        # JComb's diffusion and MCTS code still read these legacy top-level aliases.
+        # Legacy aliases used by diffusion/MCTS code.
         "eps": 1e-3,
         "noise_eps": 1e-3,
-        "lmbda": 100,
+        "lmbda": 1,
         "dmpo": {
-            "lr": trial.suggest_categorical("lr", [1e-4]),
+            "lr": trial.suggest_float(
+                "dmpo_lr",
+                1e-4,
+                1e-3,
+                log=True,
+            ),
             "batch_size": 2048,
-            "alpha": trial.suggest_categorical("alpha", [5e-3]),
+            "alpha": trial.suggest_categorical(
+                "dmpo_alpha",
+                [3e-5, 0.1, 6.0],
+            ),
             "importance_coefficient": 1.0,
-            "clip_grad_norm": 2.0,
-            "num_replicates": 16, #at replication time, the num_samples size is multiplied by this number
+            "clip_grad_norm": trial.suggest_categorical(
+                "clip_grad_norm",
+                [2.0, -1],
+            ),
+            "num_replicates": 16,
             "mask_eps": 1e-3,
-            "centering": True, #dangerous
-            "num_samples": 100 // x, # num samples in the dataset
+            "centering": trial.suggest_categorical(
+                "centering",
+                [False, True],
+            ),
+            "num_samples": 100 // x,
         },
         "sampling": {
             "predictor": "ddpm_cache",
             "seq_length": 32,
-            # "sampling_eps": 1e-3,
             "steps": 32,
             "noise_removal": True,
         },
+        # Inner optimization loop.
         "trainer": {
-            "max_epochs": 32,
+            "max_epochs": trial.suggest_categorical(
+                "max_epochs",
+                [20, 32],
+            ),
         },
-        # "mode": "train",
-        # "diffusion": "absorbing_state",
-        # "vocab": "old_smiles",
-        # "backbone": "finetune_roformer",
-        # "parameterization": "subs",
+        "resample_every": trial.suggest_categorical(
+            "resample_every",
+            [8, 10, 20, 32],
+        ),
+        # Outer optimization remains fixed at 1000 steps.
+        # "outer_gradient_steps": 1000,
         "time_conditioning": False,
         "T": 0,
-        # "subs_masking": False,
         "seed": 42,
-        # "checkpoint": "../peptidesgym/checkpoints/peptune-pretrained.ckpt",
-        "resample_every": trial.suggest_categorical("resample_every", [8]),
         "num_eval_samples": 2048,
         "training": {
             "antithetic_sampling": True,
             "sampling_eps": 1e-3,
         },
         "eval": {
-            # "checkpoint_path": None,
             "gen_ppl_eval_model_name_or_path": "gpt2-large",
             "perplexity_batch_size": 8,
         },
@@ -289,21 +349,35 @@ def optuna_entry(trial: optuna.Trial) -> float:
             "max_position_embeddings": 32,
         },
         "wandb": args.wandb,
-        "project_name": 'jcomb',
-        "run_name": f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}",
+        "project_name": args.name,
+        "run_name": (f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d_%H-%M-%S}_trial-{trial.number}"),
     }
     resolved = OmegaConf.create(config)
     return main(resolved)
 
 
 if __name__ == "__main__":
-    # cli_args = parse_args()
-    # study = optuna.create_study(
-    #     study_name=cli_args.name,
-    #     sampler=optuna.samplers.BruteForceSampler(seed=cli_args.optuna_seed),
-    #     direction="maximize",
-    #     storage="sqlite:///optuna_store.db",
-    #     load_if_exists=True,
-    # )
-    # study.optimize(optuna_entry, n_trials=9)
-    optuna_entry(optuna.trial.FixedTrial({"lr": 1e-4, "alpha": 5e-3, "resample_every": 8}))
+    cli_args = parse_args()
+    n_jobs = 1  # Number of parallel jobs for Optuna optimization
+    sampler = optuna.samplers.TPESampler(
+        seed=42,
+        n_startup_trials=20,
+        n_ei_candidates=48,
+        multivariate=True,
+        group=True,
+        constant_liar=n_jobs > 1,
+    )
+
+    study = optuna.create_study(
+        study_name=cli_args.name,
+        sampler=sampler,
+        direction="maximize",
+        storage="sqlite:///optuna_store.db",
+        load_if_exists=True,
+    )
+    study.optimize(
+        optuna_entry,
+        n_trials=200,
+        n_jobs=n_jobs,
+        gc_after_trial=True,
+    )
