@@ -11,13 +11,16 @@ from diffusiongym.types import D
 class MOReward(Reward[D]):
     """Reward with an explicit number of reward dimensions."""
 
-    def __init__(self,ref_point: torch.Tensor, num_rew: int = 1):
+    def __init__(self, reward: Reward[D], num_rew: int = 1, ref_point: torch.Tensor | None = None):
         self.num_rew = num_rew
+        if ref_point is None:
+            ref_point = torch.zeros(self.num_rew)
         self.ref_point = ref_point
         assert self.ref_point.shape == (self.num_rew,), f"Expected ref_point with shape ({self.num_rew},); got {self.ref_point.shape}" 
+        self.reward = reward
 
     def __call__(self, sample: D, latent: D, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
-        raise NotImplementedError
+        return self.reward(sample, latent, **kwargs)
 
 
 class CombinedRewards(MOReward[D]):
@@ -27,10 +30,6 @@ class CombinedRewards(MOReward[D]):
         self.rewards = list(rewards)
         if ref_point is None:
             ref_point = torch.stack([reward.ref_point for reward in self.rewards])
-        super().__init__(
-            num_rew=sum([reward.num_rew if isinstance(reward, MOReward) else 1 for reward in self.rewards]),
-            ref_point=ref_point,
-         )
 
     def __call__(self, sample: D, latent: D, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         rewards = []
