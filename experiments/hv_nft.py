@@ -1,6 +1,7 @@
 import argparse
 from argparse import Namespace
 from math import ceil
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +14,13 @@ from utils import seed_everything
 
 from genexp.mo.base import MOReward
 from genexp.mo.utils import HVComputer
+from genexp.resume import (
+    load_latest_training_checkpoint,
+    mark_run_complete,
+    resolve_run,
+    restore_rng_state,
+    save_training_checkpoint,
+)
 from genexp.trainers.hv_rl import HVRL
 from genexp.wandb_log import WandbLogger
 
@@ -20,6 +28,7 @@ from genexp.wandb_log import WandbLogger
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--force_new_start", action="store_true")
     parser.add_argument("--name", type=str, default="hv_dxtb_test2")
     parser.add_argument("--project_name", type=str, default="whos_back")
 
@@ -105,6 +114,23 @@ def main(config: Namespace) -> None:
     assert config.update_pretrained_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.sample_nm1_every_n_steps == 0
 
+    results_root = Path("output") / config.project_name
+    run_resolution = resolve_run(config, results_root, config.run_name)
+    if run_resolution.completed:
+        print(f"Matching run is already complete: {run_resolution.run_dir}")
+        return
+
+    print(f"run_dir={run_resolution.run_dir}")
+    log = WandbLogger(
+        project_name=config.project_name,
+        config=vars(config),
+        use_wandb=config.wandb,
+        run_name=run_resolution.run_dir.name,
+        id=run_resolution.wandb_run_id,
+        resume="allow",
+        dir=str(run_resolution.run_dir),
+    )
+
     seed_everything(int(config.seed))
 
     print("problem=dxtb_10A")
@@ -119,16 +145,21 @@ def main(config: Namespace) -> None:
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
 
+    resume_checkpoint = load_latest_training_checkpoint(run_resolution.run_dir, map_location=device)
+    start_epoch = 0
+    samples = None
+    advantages = None
+    if resume_checkpoint is not None:
+        trainer.load_training_state_dict(resume_checkpoint["trainer_state"])
+        start_epoch = resume_checkpoint["next_epoch"]
+        loop_state = resume_checkpoint.get("loop_state", {})
+        samples = loop_state.get("samples")
+        advantages = loop_state.get("advantages")
+        restore_rng_state(resume_checkpoint)
+
     vol_samples = config.vol_samples
 
-    log = WandbLogger(
-        project_name=config.project_name,
-        config=vars(config),
-        use_wandb=config.wandb,
-        run_name=config.run_name,
-    )
-
-    epoch = log.set_step_metric(0, "epoch")
+    epoch = log.set_step_metric(start_epoch, "epoch")
 
     n_hv = log.watch("n_hypervolume", "epoch")
     full_hv = log.watch("full_hypervolume", "epoch")
@@ -137,7 +168,7 @@ def main(config: Namespace) -> None:
     valid_frac = log.watch("valid_fraction", "epoch")
 
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
-    for _ in tqdm(range(config.epochs)):
+    for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
                 trainer.update_base_model()
@@ -150,10 +181,11 @@ def main(config: Namespace) -> None:
             with trainer.timer.section("generate_dataset"):
                 samples, advantages = trainer.generate_dataset_fv()
                 
-        if not samples:
-            print("No valid samples generated. Skipping finetuning for this epoch.")
+        if not samples or not advantages:
+            print("No valid samples or advantages, skipping epoch.")
+            epoch += 1
             continue
-
+        
         with trainer.timer.section("finetune"):
             timed_stats = trainer.finetune(samples, advantages)
             
@@ -175,16 +207,27 @@ def main(config: Namespace) -> None:
         
         with trainer.timer.section("evaluate_hypervolume"):            
             n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
-        
+
         energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
-        
-        epoch += 1
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
             print(f"{name:30s}  n={cnt:5d}  total={total:8.3f}s  mean={mean*1e3:7.2f}ms  "
                 f"p50={p50*1e3:7.2f}ms  p95={p95*1e3:7.2f}ms")
+
+        epoch += 1
+        save_training_checkpoint(
+            run_resolution.run_dir,
+            next_epoch=epoch.val,
+            trainer_state=trainer.training_state_dict(),
+            loop_state={
+                "samples": samples,
+                "advantages": advantages,
+            },
+        )
+
     log.finish()
+    mark_run_complete(run_resolution.run_dir)
 
 
 if __name__ == "__main__":

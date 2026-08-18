@@ -1,6 +1,3 @@
-from fsspec.implementations.http import ex
-import enum
-from genexp.trainers.utils import StepTimer
 import copy
 from argparse import Namespace
 from collections.abc import Callable
@@ -17,6 +14,7 @@ from diffusiongym.types import D
 from genexp.mo.base import MOReward
 from genexp.mo.utils import HVComputer
 from genexp.trainers.adjoint_matching import create_timestep_subset
+from genexp.trainers.utils import StepTimer
 
 
 class RewardStatTracker:
@@ -130,6 +128,31 @@ class DiffusionNFTrainer:
         if hasattr(self, "optimizer"):
             del self.optimizer
         self.optimizer = torch.optim.Adam(self.fine_model.parameters(), lr=self.config.lr)
+
+    def training_state_dict(self) -> dict[str, Any]:
+        """Return all mutable trainer state needed to resume training."""
+        return {
+            "fine_model": self.fine_model.state_dict(),
+            "base_model": self.base_model.state_dict(),
+            "exploration_model": self.exploration_model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "optimizer_steps": self.optimizer_steps,
+            "reward_stat_tracker": {
+                "mean": self.reward_stat_tracker.mean,
+                "std": self.reward_stat_tracker.std,
+            },
+        }
+
+    def load_training_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore mutable trainer state produced by training_state_dict."""
+        self.fine_model.load_state_dict(state["fine_model"])
+        self.base_model.load_state_dict(state["base_model"])
+        self.exploration_model.load_state_dict(state["exploration_model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.optimizer_steps = state["optimizer_steps"]
+        reward_stat_tracker = state["reward_stat_tracker"]
+        self.reward_stat_tracker.mean = reward_stat_tracker["mean"]
+        self.reward_stat_tracker.std = reward_stat_tracker["std"]
 
     def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor]:
         """Collect exploration-policy samples and normalize their rewards."""
@@ -322,6 +345,19 @@ class HVRL(DiffusionNFTrainer):
         with torch.no_grad():
             self.evaluations_X_ = self.sample_rewards()
             self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
+
+    def training_state_dict(self) -> dict[str, Any]:
+        state = super().training_state_dict()
+        state["evaluations_X_"] = getattr(self, "evaluations_X_", None)
+        state["hypervolume_X_"] = getattr(self, "hypervolume_X_", None)
+        return state
+
+    def load_training_state_dict(self, state: dict[str, Any]) -> None:
+        super().load_training_state_dict(state)
+        for name in ("evaluations_X_", "hypervolume_X_"):
+            value = state.get(name)
+            if value is not None:
+                setattr(self, name, value)
 
     def hv_first_variation(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
         obj_x, info = self.reward(sample, latent)

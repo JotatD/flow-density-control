@@ -1,8 +1,10 @@
+from collections.abc import Callable
+
 import wandb
 
 
 class MetricSentinel:
-    def __init__(self, name: str, val = None, call_fn: callable = None):
+    def __init__(self, name: str, val = None, call_fn: Callable | None = None):
         self.name = name
         self._val = None
         self.call_fn = call_fn if call_fn is not None else lambda x: x
@@ -27,7 +29,7 @@ class MetricSentinel:
         return str(self.val)
 
 class NumericSentinel(MetricSentinel):
-    def __init__(self, name: str, val = None, call_fn: callable = None):
+    def __init__(self, name: str, call_fn: Callable, val = None):
         self.history = []
         def new_call_fn(val):
             self.history.append(val)
@@ -48,12 +50,29 @@ class NumericSentinel(MetricSentinel):
         return self.history.index(self.min_val())
     
 class WandbLogger:
-    def __init__(self, use_wandb: bool = False, project_name: str = "default", run_name: str = "default", config: dict = {}):
+    def __init__(
+        self,
+        config: dict,
+        use_wandb: bool = False,
+        project_name: str = "default",
+        run_name: str = "default",
+        id: str | None = None,
+        resume: str | None = None,
+        dir: str | None = None,
+    ):
         self.use_wandb = use_wandb
         self.project_name = project_name
         self.run_name = run_name
         self.config = config        
-        self.run = wandb.init(project=self.project_name, name=self.run_name, config=self.config, mode="disabled" if not self.use_wandb else "online")
+        self.run = wandb.init(
+            project=self.project_name,
+            name=self.run_name,
+            config=self.config,
+            mode="disabled" if not self.use_wandb else "online",
+            id=id,
+            resume=resume,
+            dir=dir,
+        )
         
         self.step_metrics = {}
         
