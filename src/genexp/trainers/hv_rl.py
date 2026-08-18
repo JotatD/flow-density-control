@@ -1,3 +1,5 @@
+from fsspec.implementations.http import ex
+import enum
 from genexp.trainers.utils import StepTimer
 import copy
 from argparse import Namespace
@@ -95,6 +97,7 @@ class DiffusionNFTrainer:
         # policy used for sampling, and the trainable fine policy.
         self.config = config
         self.device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.only_valids = config.only_valids
 
         self.batch_size: int = config.batch_size
 
@@ -142,14 +145,18 @@ class DiffusionNFTrainer:
             while remaining > 0:
                 batch = min(remaining, self.batch_size)
                 env_sample = self.env.sample(batch, pbar=False)
-                rewards, _ = reward(env_sample.sample, env_sample.latent)
-                all_samples.extend([sample for sample in env_sample])
-                all_rewards.append(rewards)
+                rewards, info = reward(env_sample.sample, env_sample.latent)
+                for i, sample in enumerate(env_sample):  # ty: ignore[invalid-argument-type]
+                    if not self.only_valids or (self.only_valids and info['valids'][i]):
+                        all_samples.append(sample)
+                        all_rewards.append(rewards[i])
                 remaining -= batch
         finally:
             self.env._policy = original_policy
 
-        all_rewards = torch.cat(all_rewards, dim=0)
+        if len(all_samples) == 0:
+            return [], torch.tensor([])
+        all_rewards = torch.stack(all_rewards, dim=0)
         advantages = self.reward_stat_tracker.update(all_rewards)
 
         return all_samples, advantages

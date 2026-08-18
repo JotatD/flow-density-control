@@ -43,7 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip_range", type=float, default=0.2)
     parser.add_argument("--adv_clip_max", type=float, default=5.0)
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
-    parser.add_argument("--num_inner_epochs", type=int, default=1)
+    parser.add_argument("--num_inner_epochs", type=int, default=1) # currently unused
+    parser.add_argument("--only_valids", action="store_true", default=False)
 
     parser.add_argument("--timestep_fraction", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -55,9 +56,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def evaluate_hypervolume(
+def evaluate(
     trainer: HVRL, num_samples: int, hv_computer, reward, discretization_steps: int = 128
-) -> tuple[float, float, torch.Tensor]:
+) -> tuple[float, float, torch.Tensor, float]:
     if num_samples % trainer.n != 0:
         raise ValueError(f"num_samples={num_samples} must be a multiple of n={trainer.n}")
 
@@ -66,25 +67,35 @@ def evaluate_hypervolume(
 
     original_policy = trainer.env._policy
     trainer.env.policy = trainer.fine_model
+    valids = 0
     try:
         with torch.no_grad():
             while left > 0:
                 batch = min(left, trainer.config.batch_size)
                 sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
-                rew, _ = reward(sample.sample, sample.latent)
-                rewards.append(rew)
+                rew, info = reward(sample.sample, sample.latent)
+                valids += info["valids"].sum().item()
+                rewards.extend([r for i, r in enumerate(rew) if info["valids"][i]])
                 left -= batch
     finally:
         trainer.env._policy = original_policy
+        
+    if rewards:
+        reward_values = torch.stack(rewards, dim=0)
+        full_objectives = reward_values.reshape(1, -1, trainer.num_rews)
+        full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
+    else:
+        reward_values = torch.tensor([[0, 0]], device=trainer.device)
+        full_hypervolume = 0.0
+        
+    as_many = reward_values.shape[0] - (reward_values.shape[0] % trainer.n)
+    if as_many > 0:
+        n_objectives = reward_values[:as_many].reshape(-1, trainer.n, trainer.num_rews)
+        n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
+    else: 
+        n_hypervolume = 0.0
 
-    reward_values = torch.cat(rewards, dim=0)
-    n_objectives = reward_values.reshape(-1, trainer.n, trainer.num_rews)
-    full_objectives = reward_values.reshape(1, num_samples, trainer.num_rews)
-
-    n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
-    full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
-
-    return n_hypervolume, full_hypervolume, reward_values
+    return n_hypervolume, full_hypervolume, reward_values, valids / num_samples
 
 
 def main(config: Namespace) -> None:
@@ -121,6 +132,7 @@ def main(config: Namespace) -> None:
     full_hv = log.watch("full_hypervolume", "epoch")
     energy = log.watch("energy", "epoch")
     dipole = log.watch("dipole", "epoch")
+    valid_frac = log.watch("valid_fraction", "epoch")
 
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(config.epochs)):
@@ -135,6 +147,10 @@ def main(config: Namespace) -> None:
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
                 samples, advantages = trainer.generate_dataset_fv()
+                
+        if not samples:
+            print("No valid samples generated. Skipping finetuning for this epoch.")
+            continue
 
         with trainer.timer.section("finetune"):
             timed_stats = trainer.finetune(samples, advantages)
@@ -156,7 +172,7 @@ def main(config: Namespace) -> None:
         rows = trainer.timer.summary()
         
         with trainer.timer.section("evaluate_hypervolume"):            
-            n_hv.val, full_hv.val, rewards = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
+            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
         
         energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
         
