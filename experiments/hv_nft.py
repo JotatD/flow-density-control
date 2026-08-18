@@ -1,8 +1,6 @@
 import argparse
 from argparse import Namespace
-from pathlib import Path
 
-import numpy as np
 import torch
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import XTBTask
@@ -22,37 +20,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--name", type=str, default="hv_dxtb_test2", help="W&B project name")
     parser.add_argument("--project_name", type=str, default="whos_back", help="W&B project name")
-    
+
     parser.add_argument("--run_name", type=str, default="hv_nft", help="Name of the run")
-    
+
     parser.add_argument("--seed", type=int, default=5)
-    
+
     parser.add_argument("--n", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--alpha", type=float, default=1)
-    
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--alpha", type=float, default=1e-4, help="KL regularization weight")
+    parser.add_argument("--beta", type=float, default=0.1, help="DiffusionNFT policy mixing coefficient")
+    parser.add_argument(
+        "--exploration_decay_type",
+        type=int,
+        choices=(0, 1, 2),
+        default=1,
+        help="DiffusionNFT exploration-policy EMA schedule",
+    )
+
     parser.add_argument("--num_p_nm1", type=int, default=85)
 
     parser.add_argument("--update_pretrained_every_n_steps", type=int, default=20)
-    parser.add_argument("--resample_every_n_steps", type=int, default=20)
+    parser.add_argument("--resample_every_n_steps", type=int, default=1)
     parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
-    
-    
+
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--clip_range", type=float, default=0.2)
-    parser.add_argument("--adv_clip_max", type=float, default=10.0)
-    parser.add_argument("--clip_grad_norm", type=float, default=2.0)
+    parser.add_argument("--adv_clip_max", type=float, default=5.0)
+    parser.add_argument("--clip_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_inner_epochs", type=int, default=1)
-    parser.add_argument("--beta", type=float, default=0.5)
 
-    parser.add_argument("--timestep_fraction", type=float, default=1.0)
+    parser.add_argument("--timestep_fraction", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--num_samples", type=int, default=4)
+    parser.add_argument("--num_samples", type=int, default=320)
     parser.add_argument("--num_integration_steps", type=int, default=40)
     return parser.parse_args()
 
+
 def evaluate_hypervolume(
-    trainer: HVRL, num_samples: int, hv_computer, reward, discretization_steps: int = 250
+    trainer: HVRL, num_samples: int, hv_computer, reward, discretization_steps: int = 128
 ) -> tuple[float, float, torch.Tensor]:
     """Evaluate trainer-aligned n-HV and full-set HV from exactly num_samples rewards."""
     if num_samples % trainer.n != 0:
@@ -61,14 +66,18 @@ def evaluate_hypervolume(
     rewards = []
     left = num_samples
 
+    original_policy = trainer.env._policy
     trainer.env.policy = trainer.fine_model
-    with torch.no_grad():
-        while left > 0:
-            batch = min(left, trainer.config.batch_size)
-            sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
-            rew, _ = reward(sample.sample, sample.latent)
-            rewards.append(rew)
-            left -= batch
+    try:
+        with torch.no_grad():
+            while left > 0:
+                batch = min(left, trainer.config.batch_size)
+                sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
+                rew, _ = reward(sample.sample, sample.latent)
+                rewards.append(rew)
+                left -= batch
+    finally:
+        trainer.env._policy = original_policy
 
     reward_values = torch.cat(rewards, dim=0)
     n_objectives = reward_values.reshape(-1, trainer.n, trainer.num_rews)
@@ -84,26 +93,26 @@ def main(config: Namespace) -> None:
     assert config.sample_nm1_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.sample_nm1_every_n_steps == 0
-    
-    problem_name = "dxtb_10A"
-    data_path = Path(f"assets/{problem_name}/data/obj.npy")
-    ambient = torch.from_numpy(np.load(data_path)).float()
 
     seed_everything(int(config.seed))
 
-    print(f"problem={problem_name}")
+    print("problem=dxtb_10A")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
-    unconstrained_sample = env.sample    
-    env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
-    
+    unconstrained_sample = env.sample
+    env.sample = lambda *args, **kwargs: unconstrained_sample(  # ty: ignore[invalid-assignment]
+        *args,
+        n_atoms=10,
+        **kwargs,
+    )
+
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
 
-    vol_samples = 8
+    vol_samples = 128
 
     log = WandbLogger(
         project_name=config.project_name,
@@ -111,42 +120,34 @@ def main(config: Namespace) -> None:
         use_wandb=config.wandb,
         run_name=config.run_name,
     )
-    
+
     epoch = log.set_step_metric(0, "epoch")
-    
-    n_hv = log.watch("n_hypervolume", "md_step")
-    full_hv = log.watch("full_hypervolume", "md_step")
-    obj_img = log.set_image("objective_points", "md_step")
 
-    hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
+    n_hv = log.watch("n_hypervolume", "epoch")
+    full_hv = log.watch("full_hypervolume", "epoch")
+    loss = log.watch("loss", "epoch")
 
-    # n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(
-    #     trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward
-    # )
-    # obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-
-    # print(f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
-    loss = log.watch("loss", "global_step")
-    
     for _ in tqdm(range(config.epochs)):
         if epoch.val % config.update_pretrained_every_n_steps == 0:
             trainer.update_base_model()
-            
+
         if epoch.val % config.sample_nm1_every_n_steps == 0:
             trainer.fix_optimization_problem()
-        
+
         if epoch.val % config.resample_every_n_steps == 0:
             samples, advantages = trainer.generate_dataset_fv()
-            
-        
-        loss.val = trainer.finetune(samples, advantages)            
-            
+
+        loss.val = trainer.finetune(samples, advantages)
+        trainer.update_exploration_model()
+
         n_hv.val, full_hv.val, _ = evaluate_hypervolume(
             trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward
         )
         epoch += 1
-        
+
     log.finish()
+
+
 if __name__ == "__main__":
     args = parse_args()
     main(args)
