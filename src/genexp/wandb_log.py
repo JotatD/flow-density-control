@@ -103,3 +103,10 @@ class WandbLogger:
             self.run.log(di)
             
         return MetricSentinel(name, call_fn=call_fn)
+
+    def log_dict(self, metrics: dict, step_metric: str):
+        if step_metric in self.step_metrics:
+            metrics.update({step_metric: self.step_metrics[step_metric]})
+        else:
+            print(f"Warning: step_metric '{step_metric}' not found in step_metrics, defaulting to logging without step.")
+        wandb.log(metrics)

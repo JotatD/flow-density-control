@@ -1,6 +1,8 @@
 import argparse
 from argparse import Namespace
+from math import ceil
 
+import numpy as np
 import torch
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import XTBTask
@@ -47,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--num_samples", type=int, default=320)
     parser.add_argument("--num_integration_steps", type=int, default=40)
+    
+    parser.add_argument("--vol_samples", type=int, default=128)
+    parser.add_argument("--num-time-groups", type=int, default=5)
     return parser.parse_args()
 
 
@@ -101,7 +106,7 @@ def main(config: Namespace) -> None:
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
 
-    vol_samples = 128
+    vol_samples = config.vol_samples
 
     log = WandbLogger(
         project_name=config.project_name,
@@ -114,25 +119,47 @@ def main(config: Namespace) -> None:
 
     n_hv = log.watch("n_hypervolume", "epoch")
     full_hv = log.watch("full_hypervolume", "epoch")
-    loss = log.watch("loss", "epoch")
+    energy = log.watch("energy", "epoch")
+    dipole = log.watch("dipole", "epoch")
 
+    group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(config.epochs)):
         if epoch.val % config.update_pretrained_every_n_steps == 0:
-            trainer.update_base_model()
+            with trainer.timer.section("update_base_model"):
+                trainer.update_base_model()
 
         if epoch.val % config.sample_nm1_every_n_steps == 0:
-            trainer.fix_optimization_problem()
+            with trainer.timer.section("sample_bg"):
+                trainer.fix_optimization_problem()
 
         if epoch.val % config.resample_every_n_steps == 0:
-            samples, advantages = trainer.generate_dataset_fv()
+            with trainer.timer.section("generate_dataset"):
+                samples, advantages = trainer.generate_dataset_fv()
 
-        loss.val = trainer.finetune(samples, advantages)
+        with trainer.timer.section("finetune"):
+            timed_stats = trainer.finetune(samples, advantages)
+            
+        group_stats = {}
+        fulltime_stats = {f"full/{k}": np.mean(v) for k, v in timed_stats.items()}
+        for i in range(config.num_time_groups):
+            start = i * group_length
+            end = min((i + 1) * group_length, config.num_integration_steps-1) 
+            print(start, end)   
+            for k in timed_stats:
+                group_stats[f"{i}_group/{k}"] = np.mean(timed_stats[k][start:end])
+            
+        log.log_dict(group_stats, 'epoch')
+        log.log_dict(fulltime_stats, 'epoch')
+        
         trainer.update_exploration_model()
         
         rows = trainer.timer.summary()
         
         with trainer.timer.section("evaluate_hypervolume"):            
-            n_hv.val, full_hv.val, _ = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
+            n_hv.val, full_hv.val, rewards = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
+        
+        energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+        
         epoch += 1
 
         print("\n=== Timing summary (by total time) ===")

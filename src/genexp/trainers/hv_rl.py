@@ -154,10 +154,22 @@ class DiffusionNFTrainer:
 
         return all_samples, advantages
 
-    def train_step(self, sample: Sample, advantages: torch.Tensor) -> float:
+    def train_step(self, sample: Sample, advantages: torch.Tensor) -> dict[str, list[float]]:
         clean_latent: DDMixin = sample.latent.to(self.device)
         timesteps = sample.timesteps.to(self.device)
         kwargs = sample.kwargs
+        timed_statistics = {
+            'policy_loss': [],
+            'unweighted_policy_loss': [],
+            'kl_div_loss': [],
+            'kl_div': [],
+            'old_kl_div': [],
+            'total_loss': [],
+            'x0_norm': [],
+            'x0_norm_max': [],
+            'old_deviate': [],
+            'old_deviate_max': [],
+        }
 
         T = self.env.discretization_steps
         if self.timestep_fraction < 1.0 and self.timestep_fraction > 0.0:
@@ -208,13 +220,22 @@ class DiffusionNFTrainer:
             loss = policy_loss + self.kl_weight * kl_div_loss
 
             losses.append(loss)
-
-        if not losses:
-            return float("inf")
+            
+            timed_statistics['policy_loss'].append(policy_loss.item())
+            timed_statistics['unweighted_policy_loss'].append(ori_policy_loss.mean().item())
+            timed_statistics['kl_div_loss'].append(kl_div_loss.item())
+            timed_statistics['kl_div'].append(((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
+            timed_statistics['old_kl_div'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
+            timed_statistics['total_loss'].append(loss.item())
+            timed_statistics['x0_norm'].append((clean_latent**2).aggregate("mean").mean().item())
+            timed_statistics['x0_norm_max'].append((clean_latent**2).aggregate("max").mean().item())
+            timed_statistics['old_deviate'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
+            timed_statistics['old_deviate_max'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("max").mean().item())
 
         loss = torch.stack(losses).mean()
+    
         if loss.isnan():
-            return float("inf")
+            return {}
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -223,21 +244,24 @@ class DiffusionNFTrainer:
         self.optimizer.step()
         self.optimizer_steps += 1
 
-        return loss.item()
+        return timed_statistics
 
-    def finetune(self, samples: list[Sample], advantages: torch.Tensor) -> float:
+    def finetune(self, samples: list[Sample], advantages: torch.Tensor) -> dict[str, list[float]]:
         """Finetune the fine model using the given samples and advantages."""
         self.fine_model.train()
-        losses = []
-        for _ in range(self.num_inner_epochs):
-            start = 0
-            while start < len(samples):
-                advs = advantages[start : start + self.batch_size]
-                batch_samples = Sample.concat(samples[start : start + self.batch_size])
-                with self.timer.section("train_step"):
-                    losses.append(self.train_step(batch_samples, advs))
-                start += self.batch_size
-        return sum(losses) / len(losses)
+        stats_avgs_per_batch = []
+        start = 0
+        while start < len(samples):
+            advs = advantages[start : start + self.batch_size]
+            batch_samples = Sample.concat(samples[start : start + self.batch_size])
+            stats_avgs_per_batch.append(self.train_step(batch_samples, advs))
+            start += self.batch_size
+                
+        timed_final_stats = stats_avgs_per_batch[0]
+        for key in timed_final_stats:
+            for t in range(len(timed_final_stats[key])):
+                timed_final_stats[key][t] = np.mean([stats[key][t] for stats in stats_avgs_per_batch])
+        return timed_final_stats
 
     @torch.no_grad()
     def update_exploration_model(self) -> None:
@@ -287,28 +311,24 @@ class HVRL(DiffusionNFTrainer):
 
     def fix_optimization_problem(self):
         with torch.no_grad():
-            with self.timer.section("sample_bg"):
-                self.evaluations_X_ = self.sample_rewards()
-            with self.timer.section("compute_hv_bg"):
-                self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
+            self.evaluations_X_ = self.sample_rewards()
+            self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
 
     def hv_first_variation(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
-        with self.timer.section("compute_hv_first_variation"):
-            with self.timer.section("compute_hv_first_variation_reward"):
-                obj_x, info = self.reward(sample, latent)
-            inp_batch = obj_x.shape[0]
-            obj_x = obj_x.reshape(inp_batch, 1, 1, self.num_rews).expand(
-                inp_batch,
-                self.num_p_nm1,
-                1,
-                self.num_rews,
-            )
-            expanded_obj_X_ = self.evaluations_X_.expand(inp_batch, self.num_p_nm1, self.n - 1, self.num_rews)
-            complete_X = torch.cat([expanded_obj_X_, obj_x], dim=2)
-            complete_hv = self.hv_computer(complete_X)
-            expanded_hv_X_ = self.hypervolume_X_.expand(inp_batch, self.num_p_nm1)
-            hv_improvement = complete_hv - expanded_hv_X_
-            first_var = hv_improvement.mean(dim=1)
+        obj_x, info = self.reward(sample, latent)
+        inp_batch = obj_x.shape[0]
+        obj_x = obj_x.reshape(inp_batch, 1, 1, self.num_rews).expand(
+            inp_batch,
+            self.num_p_nm1,
+            1,
+            self.num_rews,
+        )
+        expanded_obj_X_ = self.evaluations_X_.expand(inp_batch, self.num_p_nm1, self.n - 1, self.num_rews)
+        complete_X = torch.cat([expanded_obj_X_, obj_x], dim=2)
+        complete_hv = self.hv_computer(complete_X)
+        expanded_hv_X_ = self.hypervolume_X_.expand(inp_batch, self.num_p_nm1)
+        hv_improvement = complete_hv - expanded_hv_X_
+        first_var = hv_improvement.mean(dim=1)
 
         return first_var, info
 
@@ -333,10 +353,9 @@ class HVRL(DiffusionNFTrainer):
         return rewards.reshape(self.num_p_nm1, self.n - 1, self.num_rews)
 
     def update_base_model(self):
-        with self.timer.section("update_base_model"):
-            state = self.fine_model.state_dict()
-            self.base_model.load_state_dict(state)
-            self.env.base_model.load_state_dict(state)
+        state = self.fine_model.state_dict()
+        self.base_model.load_state_dict(state)
+        self.env.base_model.load_state_dict(state)
 
     def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor]:
         """Collect trajectories, compute global advantages, build training dataset."""
