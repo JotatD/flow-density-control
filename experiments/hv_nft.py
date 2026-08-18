@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num-time-groups", type=int, default=5)
+    
+    parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="sum")
     return parser.parse_args()
 
 
@@ -136,7 +138,7 @@ def main(config: Namespace) -> None:
 
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(config.epochs)):
-        if epoch.val % config.update_pretrained_every_n_steps == 0:
+        if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
                 trainer.update_base_model()
 

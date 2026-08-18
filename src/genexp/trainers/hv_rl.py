@@ -307,6 +307,8 @@ class HVRL(DiffusionNFTrainer):
         self.num_rews = reward.num_rew
 
         self.num_p_nm1 = config.num_p_nm1
+        
+        self.scalarization = config.scalarization
 
         super().__init__(
             config,
@@ -338,6 +340,10 @@ class HVRL(DiffusionNFTrainer):
         first_var = hv_improvement.mean(dim=1)
 
         return first_var, info
+    
+    def sum_scalarization(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
+        obj_x, info = self.reward(sample, latent)
+        return obj_x.sum(dim=1), info
 
     @torch.no_grad()
     def sample_rewards(self) -> torch.Tensor:
@@ -366,4 +372,9 @@ class HVRL(DiffusionNFTrainer):
 
     def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor]:
         """Collect trajectories, compute global advantages, build training dataset."""
-        return self.generate_dataset(FirstVariation(self.hv_first_variation))
+        if self.scalarization == "improvement":
+            return self.generate_dataset(FirstVariation(self.hv_first_variation))
+        elif self.scalarization == "sum":
+            return self.generate_dataset(FirstVariation(self.sum_scalarization))
+        else:
+            raise ValueError(f"Unknown scalarization method: {self.scalarization}")
