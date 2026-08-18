@@ -1,3 +1,4 @@
+from genexp.trainers.utils import StepTimer
 import copy
 from argparse import Namespace
 from collections.abc import Callable
@@ -117,6 +118,8 @@ class DiffusionNFTrainer:
         self.exploration_model.requires_grad_(False)
         self.reward_stat_tracker = RewardStatTracker()
         self.optimizer_steps = 0
+        
+        self.timer = StepTimer(device=self.device)
 
         self.configure_optimizers()
 
@@ -157,15 +160,11 @@ class DiffusionNFTrainer:
         kwargs = sample.kwargs
 
         T = self.env.discretization_steps
-        idxs = (
-            create_timestep_subset(
-                T,
-                final_percent=0.25,
-                sample_percent=max(0.0, self.timestep_fraction - 0.25),
-            )
-            if self.timestep_fraction < 1.0
-            else np.arange(T)
-        )
+        if self.timestep_fraction < 1.0 and self.timestep_fraction > 0.0:
+            sp = max(0.0, self.timestep_fraction - 0.25)
+            idxs = create_timestep_subset(T, final_percent=0.25, sample_percent=sp)
+        else:
+            idxs = np.arange(T)
 
         adv_clipped = torch.clamp(advantages, -self.adv_clip_max, self.adv_clip_max)
         normalized_advantages_clip = 0.5 * (adv_clipped / self.adv_clip_max) + 0.5
@@ -191,22 +190,18 @@ class DiffusionNFTrainer:
             positive_endpoint = endpoint(self.base_model, positive_v, xt, t_batch)
 
             with torch.no_grad():
-                positive_weight_factor = (
-                    (positive_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
-                )
+                positive_weight_factor = (positive_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
+                
             positive_loss = ((positive_endpoint - clean_latent) ** 2).aggregate("mean") / positive_weight_factor
 
             negative_v = -self.mixing_beta * forward_prediction + (1 + self.mixing_beta) * old_prediction
             negative_endpoint = endpoint(self.base_model, negative_v, xt, t_batch)
             with torch.no_grad():
-                negative_weight_factor = (
-                    (negative_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
-                )
+                negative_weight_factor = (negative_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
+                
             negative_loss = ((negative_endpoint - clean_latent) ** 2).aggregate("mean") / negative_weight_factor
 
-            ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (
-                negative_loss / self.mixing_beta
-            )
+            ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (negative_loss / self.mixing_beta)
             policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
 
             kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean()
@@ -239,7 +234,8 @@ class DiffusionNFTrainer:
             while start < len(samples):
                 advs = advantages[start : start + self.batch_size]
                 batch_samples = Sample.concat(samples[start : start + self.batch_size])
-                losses.append(self.train_step(batch_samples, advs))
+                with self.timer.section("train_step"):
+                    losses.append(self.train_step(batch_samples, advs))
                 start += self.batch_size
         return sum(losses) / len(losses)
 
@@ -291,24 +287,28 @@ class HVRL(DiffusionNFTrainer):
 
     def fix_optimization_problem(self):
         with torch.no_grad():
-            self.evaluations_X_ = self.sample_rewards()
-            self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
+            with self.timer.section("sample_bg"):
+                self.evaluations_X_ = self.sample_rewards()
+            with self.timer.section("compute_hv_bg"):
+                self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
 
     def hv_first_variation(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
-        obj_x, info = self.reward(sample, latent)
-        inp_batch = obj_x.shape[0]
-        obj_x = obj_x.reshape(inp_batch, 1, 1, self.num_rews).expand(
-            inp_batch,
-            self.num_p_nm1,
-            1,
-            self.num_rews,
-        )
-        expanded_obj_X_ = self.evaluations_X_.expand(inp_batch, self.num_p_nm1, self.n - 1, self.num_rews)
-        complete_X = torch.cat([expanded_obj_X_, obj_x], dim=2)
-        complete_hv = self.hv_computer(complete_X)
-        expanded_hv_X_ = self.hypervolume_X_.expand(inp_batch, self.num_p_nm1)
-        hv_improvement = complete_hv - expanded_hv_X_
-        first_var = hv_improvement.mean(dim=1)
+        with self.timer.section("compute_hv_first_variation"):
+            with self.timer.section("compute_hv_first_variation_reward"):
+                obj_x, info = self.reward(sample, latent)
+            inp_batch = obj_x.shape[0]
+            obj_x = obj_x.reshape(inp_batch, 1, 1, self.num_rews).expand(
+                inp_batch,
+                self.num_p_nm1,
+                1,
+                self.num_rews,
+            )
+            expanded_obj_X_ = self.evaluations_X_.expand(inp_batch, self.num_p_nm1, self.n - 1, self.num_rews)
+            complete_X = torch.cat([expanded_obj_X_, obj_x], dim=2)
+            complete_hv = self.hv_computer(complete_X)
+            expanded_hv_X_ = self.hypervolume_X_.expand(inp_batch, self.num_p_nm1)
+            hv_improvement = complete_hv - expanded_hv_X_
+            first_var = hv_improvement.mean(dim=1)
 
         return first_var, info
 
@@ -333,9 +333,10 @@ class HVRL(DiffusionNFTrainer):
         return rewards.reshape(self.num_p_nm1, self.n - 1, self.num_rews)
 
     def update_base_model(self):
-        state = self.fine_model.state_dict()
-        self.base_model.load_state_dict(state)
-        self.env.base_model.load_state_dict(state)
+        with self.timer.section("update_base_model"):
+            state = self.fine_model.state_dict()
+            self.base_model.load_state_dict(state)
+            self.env.base_model.load_state_dict(state)
 
     def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor]:
         """Collect trajectories, compute global advantages, build training dataset."""

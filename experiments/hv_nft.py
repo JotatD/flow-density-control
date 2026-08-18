@@ -17,25 +17,19 @@ from genexp.wandb_log import WandbLogger
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--name", type=str, default="hv_dxtb_test2", help="W&B project name")
-    parser.add_argument("--project_name", type=str, default="whos_back", help="W&B project name")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--name", type=str, default="hv_dxtb_test2")
+    parser.add_argument("--project_name", type=str, default="whos_back")
 
-    parser.add_argument("--run_name", type=str, default="hv_nft", help="Name of the run")
+    parser.add_argument("--run_name", type=str, default="hv_nft")
 
     parser.add_argument("--seed", type=int, default=5)
 
     parser.add_argument("--n", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--alpha", type=float, default=1e-4, help="KL regularization weight")
-    parser.add_argument("--beta", type=float, default=0.1, help="DiffusionNFT policy mixing coefficient")
-    parser.add_argument(
-        "--exploration_decay_type",
-        type=int,
-        choices=(0, 1, 2),
-        default=1,
-        help="DiffusionNFT exploration-policy EMA schedule",
-    )
+    parser.add_argument("--alpha", type=float, default=1e-4)
+    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--exploration_decay_type", type=int, choices=(0, 1, 2), default=1)
 
     parser.add_argument("--num_p_nm1", type=int, default=85)
 
@@ -59,7 +53,6 @@ def parse_args() -> argparse.Namespace:
 def evaluate_hypervolume(
     trainer: HVRL, num_samples: int, hv_computer, reward, discretization_steps: int = 128
 ) -> tuple[float, float, torch.Tensor]:
-    """Evaluate trainer-aligned n-HV and full-set HV from exactly num_samples rewards."""
     if num_samples % trainer.n != 0:
         raise ValueError(f"num_samples={num_samples} must be a multiple of n={trainer.n}")
 
@@ -103,11 +96,7 @@ def main(config: Namespace) -> None:
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
     unconstrained_sample = env.sample
-    env.sample = lambda *args, **kwargs: unconstrained_sample(  # ty: ignore[invalid-assignment]
-        *args,
-        n_atoms=10,
-        **kwargs,
-    )
+    env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
 
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
@@ -139,12 +128,17 @@ def main(config: Namespace) -> None:
 
         loss.val = trainer.finetune(samples, advantages)
         trainer.update_exploration_model()
-
-        n_hv.val, full_hv.val, _ = evaluate_hypervolume(
-            trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward
-        )
+        
+        rows = trainer.timer.summary()
+        
+        with trainer.timer.section("evaluate_hypervolume"):            
+            n_hv.val, full_hv.val, _ = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
         epoch += 1
 
+        print("\n=== Timing summary (by total time) ===")
+        for name, cnt, total, mean, p50, p95 in rows:
+            print(f"{name:30s}  n={cnt:5d}  total={total:8.3f}s  mean={mean*1e3:7.2f}ms  "
+                f"p50={p50*1e3:7.2f}ms  p95={p95*1e3:7.2f}ms")
     log.finish()
 
 
