@@ -154,12 +154,13 @@ class DiffusionNFTrainer:
         self.reward_stat_tracker.mean = reward_stat_tracker["mean"]
         self.reward_stat_tracker.std = reward_stat_tracker["std"]
 
-    def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor]:
+    def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor, list[dict[str, Any]]]:
         """Collect exploration-policy samples and normalize their rewards."""
         self.fine_model.eval()
         self.exploration_model.eval()
         all_samples: list[Sample] = []
         all_rewards = []
+        all_infos = []
         remaining = self.config.num_samples
 
         original_policy = self.env._policy
@@ -169,6 +170,7 @@ class DiffusionNFTrainer:
                 batch = min(remaining, self.batch_size)
                 env_sample = self.env.sample(batch, pbar=False)
                 rewards, info = reward(env_sample.sample, env_sample.latent)
+                all_infos.append(info)
                 for i, sample in enumerate(env_sample):  # ty: ignore[invalid-argument-type]
                     if not self.only_valids or (self.only_valids and info['valids'][i]):
                         all_samples.append(sample)
@@ -178,11 +180,11 @@ class DiffusionNFTrainer:
             self.env._policy = original_policy
 
         if len(all_samples) == 0:
-            return [], torch.tensor([])
+            return [], torch.tensor([]), []
         all_rewards = torch.stack(all_rewards, dim=0)
         advantages = self.reward_stat_tracker.update(all_rewards)
 
-        return all_samples, advantages
+        return all_samples, advantages, all_infos
 
     def train_step(self, sample: Sample, advantages: torch.Tensor) -> dict[str, list[float]]:
         clean_latent: DDMixin = sample.latent.to(self.device)
@@ -375,11 +377,17 @@ class HVRL(DiffusionNFTrainer):
         hv_improvement = complete_hv - expanded_hv_X_
         first_var = hv_improvement.mean(dim=1)
 
+        info['obj'] = obj_x
+        info['scalarization'] = first_var
         return first_var, info
     
     def sum_scalarization(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
         obj_x, info = self.reward(sample, latent)
-        return obj_x.sum(dim=1), info
+        
+        scalarization = obj_x.sum(dim=1)
+        info['obj'] = obj_x
+        info['scalarization'] = scalarization
+        return scalarization, info
 
     @torch.no_grad()
     def sample_rewards(self) -> torch.Tensor:
@@ -406,11 +414,25 @@ class HVRL(DiffusionNFTrainer):
         self.base_model.load_state_dict(state)
         self.env.base_model.load_state_dict(state)
 
-    def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor]:
+    def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor, dict[str, Any]]:
         """Collect trajectories, compute global advantages, build training dataset."""
         if self.scalarization == "improvement":
-            return self.generate_dataset(FirstVariation(self.hv_first_variation))
+            samples, advantages, infos = self.generate_dataset(FirstVariation(self.hv_first_variation))
         elif self.scalarization == "sum":
-            return self.generate_dataset(FirstVariation(self.sum_scalarization))
+            samples, advantages, infos = self.generate_dataset(FirstVariation(self.sum_scalarization))
         else:
             raise ValueError(f"Unknown scalarization method: {self.scalarization}")
+        
+        final_obj = []
+        scalarization = []
+        final_valids = []
+        for batch_info in infos:
+            final_obj.append(batch_info["obj"])
+            scalarization.append(batch_info["scalarization"])
+            final_valids.append(batch_info["valids"])
+        final_obj = torch.cat(final_obj, dim=0).detach().cpu().numpy()
+        scalarization = torch.cat(scalarization, dim=0).detach().cpu().numpy()
+        final_valids = torch.cat(final_valids).detach().cpu().numpy()
+
+        final_info = {"obj": final_obj.reshape(-1, self.num_rews), "scalarization": scalarization, "valids": final_valids}
+        return samples, advantages, final_info

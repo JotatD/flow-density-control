@@ -1,18 +1,21 @@
 import argparse
 from argparse import Namespace
+from ast import parse
 from math import ceil
 from pathlib import Path
 
 import numpy as np
 import torch
+from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
-from diffusiongym.molecules import XTBTask
+from diffusiongym.molecules import DDGraph, XTBTask
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.rewards import DummyReward
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.base import MOReward
+from genexp.mo.moses import diversity_metrics
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
     load_latest_training_checkpoint,
@@ -47,6 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--update_pretrained_every_n_steps", type=int, default=20)
     parser.add_argument("--resample_every_n_steps", type=int, default=1)
     parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
+    parser.add_argument("--evaluate_diversity_every_n_steps", type=int, default=100)
+    
+    parser.add_argument("--num_diversity_samples", type=int, default=1000)
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--clip_range", type=float, default=0.2)
@@ -63,50 +69,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num-time-groups", type=int, default=5)
     
-    parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="sum")
+    parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
     return parser.parse_args()
 
-
-def evaluate(
-    trainer: HVRL, num_samples: int, hv_computer, reward, discretization_steps: int = 128
-) -> tuple[float, float, torch.Tensor, float]:
-    if num_samples % trainer.n != 0:
-        raise ValueError(f"num_samples={num_samples} must be a multiple of n={trainer.n}")
-
-    rewards = []
+def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
     left = num_samples
+    samples: list[Sample] = []
 
     original_policy = trainer.env._policy
     trainer.env.policy = trainer.fine_model
-    valids = 0
     try:
         with torch.no_grad():
             while left > 0:
                 batch = min(left, trainer.config.batch_size)
                 sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
-                rew, info = reward(sample.sample, sample.latent)
-                valids += info["valids"].sum().item()
-                rewards.extend([r for i, r in enumerate(rew) if info["valids"][i]])
+                samples.extend([s for s in sample])
                 left -= batch
     finally:
         trainer.env._policy = original_policy
+    
+    return samples
+
+
+def evaluate(samples: list[Sample], reward: MOReward, hv_computer: HVComputer, n: int) -> tuple[float, float, torch.Tensor, float]:
+    samples_cat = Sample.concat(samples)
+    rew, info = reward(samples_cat.sample, samples_cat.latent)
+    valids = info["valids"].sum().item()
+    rewards = [r for i, r in enumerate(rew) if info["valids"][i]]
         
     if rewards:
         reward_values = torch.stack(rewards, dim=0)
-        full_objectives = reward_values.reshape(1, -1, trainer.num_rews)
+        full_objectives = reward_values.reshape(1, -1, reward.num_rew)
         full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
     else:
-        reward_values = torch.tensor([[0, 0]], device=trainer.device)
+        reward_values = torch.tensor([[0, 0]])
         full_hypervolume = 0.0
         
-    as_many = reward_values.shape[0] - (reward_values.shape[0] % trainer.n)
+    as_many = reward_values.shape[0] - (reward_values.shape[0] % n)
     if as_many > 0:
-        n_objectives = reward_values[:as_many].reshape(-1, trainer.n, trainer.num_rews)
+        n_objectives = reward_values[:as_many].reshape(-1, n, reward.num_rew)
         n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
     else: 
         n_hypervolume = 0.0
 
-    return n_hypervolume, full_hypervolume, reward_values, valids / num_samples
+    return n_hypervolume, full_hypervolume, reward_values, valids / len(samples)
 
 
 def main(config: Namespace) -> None:
@@ -166,22 +172,44 @@ def main(config: Namespace) -> None:
     energy = log.watch("energy", "epoch")
     dipole = log.watch("dipole", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
+    valid_div = log.watch("diversity/valid_diversity", "epoch")
+    diversity = log.watch("diversity/diversity", "epoch")
+    urscat = log.watch("diversity/vendi_usrcat", "epoch")
+    auc = log.watch("diversity/auc_coverage", "epoch")
+    dataset_valid = log.watch("dataset/valid_fraction", "epoch")
+    dataset_energy = log.watch("dataset/energy", "epoch")
+    dataset_dipole = log.watch("dataset/dipole", "epoch")
+    dataset_fv = log.watch("dataset/first_variation", "epoch")
+    hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(start_epoch, config.epochs)):
+        if epoch.val % config.evaluate_diversity_every_n_steps == 0:
+            with trainer.timer.section("evaluate_diversity"):
+                samples = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+                valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples)
+        
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
                 trainer.update_base_model()
 
-        if epoch.val % config.sample_nm1_every_n_steps == 0:
+        if epoch.val % config.sample_nm1_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("sample_bg"):
                 trainer.fix_optimization_problem()
+                
+                hypervol_X_.val = trainer.hypervolume_X_.median().item()
 
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
-                samples, advantages = trainer.generate_dataset_fv()
+                samples, advantages, info = trainer.generate_dataset_fv()
                 
-        if not samples or not advantages:
+                dataset_valid.val = np.mean(info["valids"])
+                dataset_energy.val = np.median(info["obj"][:, 0])
+                dataset_dipole.val = np.median(info["obj"][:, 1])
+                dataset_fv.val = np.median(info["scalarization"])
+            
+                
+        if not samples or advantages is None:
             print("No valid samples or advantages, skipping epoch.")
             epoch += 1
             continue
@@ -205,8 +233,9 @@ def main(config: Namespace) -> None:
         
         rows = trainer.timer.summary()
         
-        with trainer.timer.section("evaluate_hypervolume"):            
-            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, num_samples=vol_samples, hv_computer=hv_computer, reward=reward)
+        with trainer.timer.section("evaluate_hypervolume"):           
+            samples = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples, reward, hv_computer, n=config.n)
 
         energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
 
