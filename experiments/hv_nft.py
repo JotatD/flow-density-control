@@ -185,13 +185,13 @@ def main(config: Namespace) -> None:
     for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
-                samples = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
                 if epoch.val == 0:
                     valid_div.val = 0.678
                     diversity.val = 0.67491
                     urscat.val = 86.64319
                     auc.val = 274.025
                 else:
+                    samples = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
                     valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples)
         
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
