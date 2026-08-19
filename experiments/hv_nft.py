@@ -152,13 +152,13 @@ def main(config: Namespace) -> None:
 
     resume_checkpoint = load_latest_training_checkpoint(run_resolution.run_dir, map_location=device)
     start_epoch = 0
-    samples = None
+    dataset = None
     advantages = None
     if resume_checkpoint is not None:
         trainer.load_training_state_dict(resume_checkpoint["trainer_state"])
         start_epoch = resume_checkpoint["next_epoch"]
         loop_state = resume_checkpoint.get("loop_state", {})
-        samples = loop_state.get("samples")
+        dataset = loop_state.get("dataset")
         advantages = loop_state.get("advantages")
         restore_rng_state(resume_checkpoint)
 
@@ -191,8 +191,8 @@ def main(config: Namespace) -> None:
                     urscat.val = 86.64319
                     auc.val = 274.025
                 else:
-                    samples = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-                    valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples)
+                    samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+                    valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples_diversity)
         
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
@@ -206,7 +206,7 @@ def main(config: Namespace) -> None:
 
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
-                samples, advantages, info = trainer.generate_dataset_fv()
+                dataset, advantages, info = trainer.generate_dataset_fv()
                 
                 dataset_valid.val = np.mean(info["valids"])
                 dataset_energy.val = np.median(info["obj"][:, 0])
@@ -214,13 +214,13 @@ def main(config: Namespace) -> None:
                 dataset_fv.val = np.median(info["scalarization"])
             
                 
-        if not samples or advantages is None:
-            print("No valid samples or advantages, skipping epoch.")
+        if not dataset or advantages is None:
+            print("No valid dataset or advantages, skipping epoch.")
             epoch += 1
             continue
         
         with trainer.timer.section("finetune"):
-            timed_stats = trainer.finetune(samples, advantages)
+            timed_stats = trainer.finetune(dataset, advantages)
             
         group_stats = {}
         fulltime_stats = {f"full/{k}": np.mean(v) for k, v in timed_stats.items()}
@@ -239,8 +239,8 @@ def main(config: Namespace) -> None:
         rows = trainer.timer.summary()
         
         with trainer.timer.section("evaluate_hypervolume"):           
-            samples = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples, reward, hv_computer, n=config.n)
+            samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
 
         energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
 
@@ -255,7 +255,7 @@ def main(config: Namespace) -> None:
             next_epoch=epoch.val,
             trainer_state=trainer.training_state_dict(),
             loop_state={
-                "samples": samples,
+                "dataset": dataset,
                 "advantages": advantages,
             },
         )
