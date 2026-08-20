@@ -62,7 +62,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--timestep_fraction", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-5)
+    
     parser.add_argument("--num_samples", type=int, default=320)
+    parser.add_argument("--advantage_group_size", type=int, default=16)
+    parser.add_argument("--fulfill_num_samples", action="store_true")
+    parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
     parser.add_argument("--num_integration_steps", type=int, default=40)
     
     parser.add_argument("--vol_samples", type=int, default=128)
@@ -118,6 +122,7 @@ def main(config: Namespace) -> None:
     assert config.sample_nm1_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.sample_nm1_every_n_steps == 0
+    assert (not config.fulfill_num_samples and not config.only_valids) or (config.fulfill_num_samples and config.only_valids)
 
     results_root = Path("output") / config.project_name
     run_resolution = resolve_run(config, results_root, config.run_name)
@@ -175,10 +180,8 @@ def main(config: Namespace) -> None:
     diversity = log.watch("diversity/diversity", "epoch")
     urscat = log.watch("diversity/vendi_usrcat", "epoch")
     auc = log.watch("diversity/auc_coverage", "epoch")
-    dataset_valid = log.watch("dataset/valid_fraction", "epoch")
-    dataset_energy = log.watch("dataset/energy", "epoch")
-    dataset_dipole = log.watch("dataset/dipole", "epoch")
-    dataset_fv = log.watch("dataset/first_variation", "epoch")
+    first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
+    fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
@@ -201,17 +204,16 @@ def main(config: Namespace) -> None:
         if epoch.val % config.sample_nm1_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("sample_bg"):
                 trainer.fix_optimization_problem()
-                
                 hypervol_X_.val = trainer.hypervolume_X_.median().item()
 
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
-                dataset, advantages, info = trainer.generate_dataset_fv()
+                dataset, advantages, fv = trainer.generate_dataset_fv()
                 
-                dataset_valid.val = np.mean(info["valids"])
-                dataset_energy.val = np.median(info["obj"][:, 0])
-                dataset_dipole.val = np.median(info["obj"][:, 1])
-                dataset_fv.val = np.median(info["scalarization"])
+                fulfillment.val = len(dataset) / config.num_samples
+    
+                if dataset:
+                    first_var.val = torch.median(fv).item()
             
                 
         if not dataset or advantages is None:

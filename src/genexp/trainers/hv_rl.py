@@ -18,17 +18,38 @@ from genexp.trainers.utils import StepTimer
 
 
 class RewardStatTracker:
-    """Normalize one prompt-free sampling round like DiffusionNFT's global tracker."""
+    """Normalize rewards within contiguous groups."""
 
-    def __init__(self):
-        self.mean = None
-        self.std = None
+    def __init__(self, advantage_group_size: int = 16):
+        self.advantage_group_size = advantage_group_size
 
     def update(self, rewards: torch.Tensor) -> torch.Tensor:
         rewards = rewards.detach()
-        self.mean = rewards.mean()
-        self.std = rewards.std(correction=0)
-        return (rewards - self.mean) / (self.std + 1e-4)
+        batch_size = rewards.shape[0]
+        group_size = self.advantage_group_size
+        greatest_multiple = (batch_size // group_size) * group_size
+        normalized_parts = []
+        if greatest_multiple > 0:
+            rewards_batch = rewards[:greatest_multiple]
+            rewards_batch = rewards_batch.reshape(-1, group_size)
+
+            rewards_mean = rewards_batch.mean(dim=1, keepdim=True)
+            rewards_std = rewards_batch.std(dim=1, keepdim=True, correction=0)
+            rewards_batch = (rewards_batch - rewards_mean) / (rewards_std + 1e-4)
+            normalized_parts.append(rewards_batch.reshape(-1))
+
+        # Normalize remaining incomplete group
+        last_batch = rewards[greatest_multiple:]
+        if last_batch.numel() > 0:
+            last_batch_mean = last_batch.mean()
+            last_batch_std = last_batch.std(correction=0)
+            last_batch = (last_batch - last_batch_mean) / (last_batch_std + 1e-4)
+            normalized_parts.append(last_batch)
+
+        if not normalized_parts:
+            return rewards
+
+        return torch.cat(normalized_parts, dim=0)
 
 
 def exploration_decay(step: int, decay_type: int) -> float:
@@ -117,10 +138,13 @@ class DiffusionNFTrainer:
         self.fine_model = env.model
         self.exploration_model = copy.deepcopy(self.base_model)
         self.exploration_model.requires_grad_(False)
-        self.reward_stat_tracker = RewardStatTracker()
+        self.reward_stat_tracker = RewardStatTracker(config.advantage_group_size)
         self.optimizer_steps = 0
+        self.fulfill_max_attempts = config.fulfill_max_attempts
         
-        self.timer = StepTimer(device=self.device)
+        self.fulfill = config.fulfill_num_samples
+        
+        self.timer = StepTimer(device=self.device, )
 
         self.configure_optimizers()
 
@@ -137,10 +161,10 @@ class DiffusionNFTrainer:
             "exploration_model": self.exploration_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "optimizer_steps": self.optimizer_steps,
-            "reward_stat_tracker": {
-                "mean": self.reward_stat_tracker.mean,
-                "std": self.reward_stat_tracker.std,
-            },
+            # "reward_stat_tracker": {
+            #     "mean": self.reward_stat_tracker.mean,
+            #     "std": self.reward_stat_tracker.std,
+            # },
         }
 
     def load_training_state_dict(self, state: dict[str, Any]) -> None:
@@ -150,41 +174,45 @@ class DiffusionNFTrainer:
         self.exploration_model.load_state_dict(state["exploration_model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.optimizer_steps = state["optimizer_steps"]
-        reward_stat_tracker = state["reward_stat_tracker"]
-        self.reward_stat_tracker.mean = reward_stat_tracker["mean"]
-        self.reward_stat_tracker.std = reward_stat_tracker["std"]
+        # reward_stat_tracker = state["reward_stat_tracker"]
+        # self.reward_stat_tracker.mean = reward_stat_tracker["mean"]
+        # self.reward_stat_tracker.std = reward_stat_tracker["std"]
 
-    def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor, list[dict[str, Any]]]:
+    def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor, torch.Tensor]:
         """Collect exploration-policy samples and normalize their rewards."""
         self.fine_model.eval()
         self.exploration_model.eval()
         all_samples: list[Sample] = []
         all_rewards = []
-        all_infos = []
         remaining = self.config.num_samples
+        self.curr_attempts = 0
 
         original_policy = self.env._policy
         self.env.policy = self.exploration_model
         try:
-            while remaining > 0:
-                batch = min(remaining, self.batch_size)
+            while remaining > 0 and self.curr_attempts < self.fulfill_max_attempts:
+                batch = self.batch_size if self.fulfill else min(self.batch_size, remaining)
                 env_sample = self.env.sample(batch, pbar=False)
                 rewards, info = reward(env_sample.sample, env_sample.latent)
-                all_infos.append(info)
+                self.curr_attempts += batch
                 for i, sample in enumerate(env_sample):  # ty: ignore[invalid-argument-type]
                     if not self.only_valids or (self.only_valids and info['valids'][i]):
                         all_samples.append(sample)
                         all_rewards.append(rewards[i])
-                remaining -= batch
+                        remaining -= 1
         finally:
             self.env._policy = original_policy
 
         if len(all_samples) == 0:
-            return [], torch.tensor([]), []
+            return [], torch.tensor([]), torch.tensor([])
+        
+        all_rewards = all_rewards[: self.config.num_samples]  
+        all_samples = all_samples[: self.config.num_samples]
+        
         all_rewards = torch.stack(all_rewards, dim=0)
         advantages = self.reward_stat_tracker.update(all_rewards)
 
-        return all_samples, advantages, all_infos
+        return all_samples, advantages, all_rewards
 
     def train_step(self, sample: Sample, advantages: torch.Tensor) -> dict[str, list[float]]:
         clean_latent: DDMixin = sample.latent.to(self.device)
@@ -194,7 +222,6 @@ class DiffusionNFTrainer:
             'policy_loss': [],
             'unweighted_policy_loss': [],
             'kl_div_loss': [],
-            'kl_div': [],
             'old_kl_div': [],
             'total_loss': [],
             'x0_norm': [],
@@ -256,13 +283,12 @@ class DiffusionNFTrainer:
             timed_statistics['policy_loss'].append(policy_loss.item())
             timed_statistics['unweighted_policy_loss'].append(ori_policy_loss.mean().item())
             timed_statistics['kl_div_loss'].append(kl_div_loss.item())
-            timed_statistics['kl_div'].append(((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
             timed_statistics['old_kl_div'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
             timed_statistics['total_loss'].append(loss.item())
             timed_statistics['x0_norm'].append((clean_latent**2).aggregate("mean").mean().item())
             timed_statistics['x0_norm_max'].append((clean_latent**2).aggregate("max").mean().item())
-            timed_statistics['old_deviate'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item())
-            timed_statistics['old_deviate_max'].append(((old_prediction - ref_forward_prediction) ** 2).aggregate("max").mean().item())
+            timed_statistics['old_deviate'].append(((old_prediction - forward_prediction) ** 2).aggregate("mean").mean().item())
+            timed_statistics['old_deviate_max'].append(((old_prediction - forward_prediction) ** 2).aggregate("max").mean().item())
 
         loss = torch.stack(losses).mean()
     
@@ -414,25 +440,13 @@ class HVRL(DiffusionNFTrainer):
         self.base_model.load_state_dict(state)
         self.env.base_model.load_state_dict(state)
 
-    def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor, dict[str, Any]]:
+    def generate_dataset_fv(self) -> tuple[list[Sample], torch.Tensor, torch.Tensor]:
         """Collect trajectories, compute global advantages, build training dataset."""
         if self.scalarization == "improvement":
-            samples, advantages, infos = self.generate_dataset(FirstVariation(self.hv_first_variation))
+            samples, advantages, rewards = self.generate_dataset(FirstVariation(self.hv_first_variation))
         elif self.scalarization == "sum":
-            samples, advantages, infos = self.generate_dataset(FirstVariation(self.sum_scalarization))
+            samples, advantages, rewards = self.generate_dataset(FirstVariation(self.sum_scalarization))
         else:
             raise ValueError(f"Unknown scalarization method: {self.scalarization}")
-        
-        final_obj = []
-        scalarization = []
-        final_valids = []
-        for batch_info in infos:
-            final_obj.append(batch_info["obj"])
-            scalarization.append(batch_info["scalarization"])
-            final_valids.append(batch_info["valids"])
-        final_obj = torch.cat(final_obj, dim=0).detach().cpu().numpy()
-        scalarization = torch.cat(scalarization, dim=0).detach().cpu().numpy()
-        final_valids = torch.cat(final_valids).detach().cpu().numpy()
-
-        final_info = {"obj": final_obj.reshape(-1, self.num_rews), "scalarization": scalarization, "valids": final_valids}
-        return samples, advantages, final_info
+            
+        return samples, advantages, rewards
