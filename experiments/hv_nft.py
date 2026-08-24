@@ -7,13 +7,14 @@ import numpy as np
 import torch
 from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
-from diffusiongym.molecules import DDGraph, XTBTask
+from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.rewards import DummyReward
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.base import MOReward
+from genexp.mo.mo_mol import MolecularMetrics
 from genexp.mo.moses import diversity_metrics
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
@@ -40,8 +41,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--n", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--alpha", type=float, default=1e-4)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--alpha", type=float, default=10)
+    parser.add_argument("--beta", type=float, default=1)
     parser.add_argument("--exploration_decay_type", type=int, choices=(0, 1, 2), default=1)
 
     parser.add_argument("--num_p_nm1", type=int, default=85)
@@ -68,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advantage_group_size", type=int, default=16)
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
-    parser.add_argument("--num_integration_steps", type=int, default=100)
+    parser.add_argument("--num_integration_steps", type=int, default=40)
     
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num-time-groups", type=int, default=5)
@@ -86,7 +87,7 @@ def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -
         with torch.no_grad():
             while left > 0:
                 batch = min(left, trainer.config.batch_size)
-                sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=False)
+                sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=True)
                 samples.extend([s for s in sample])
                 left -= batch
     finally:
@@ -106,7 +107,7 @@ def evaluate(samples: list[Sample], reward: MOReward, hv_computer: HVComputer, n
         full_objectives = reward_values.reshape(1, -1, reward.num_rew)
         full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
     else:
-        reward_values = torch.tensor([[0., 0.]], dtype=torch.float32)
+        reward_values = torch.zeros((1, reward.num_rew), device=reward.ref_point.device, dtype=torch.float32)
         full_hypervolume = 0.0
         
     as_many = reward_values.shape[0] - (reward_values.shape[0] % n)
@@ -147,11 +148,12 @@ def main(config: Namespace) -> None:
     print("problem=dxtb_10A")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
+    # reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
+    reward = MolecularMetrics()
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
-    # unconstrained_sample = env.sample
-    # env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
+    unconstrained_sample = env.sample
+    env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
 
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
@@ -174,7 +176,9 @@ def main(config: Namespace) -> None:
 
     n_hv = log.watch("n_hypervolume", "epoch")
     full_hv = log.watch("full_hypervolume", "epoch")
-    energy = log.watch("energy", "epoch")
+    # energy = log.watch("energy", "epoch")
+    qed = log.watch("qed", "epoch")
+    sa = log.watch("sa", "epoch")
     dipole = log.watch("dipole", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
     valid_div = log.watch("diversity/valid_diversity", "epoch")
@@ -189,17 +193,17 @@ def main(config: Namespace) -> None:
     for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
-                if epoch.val == 2000:
+                if epoch.val == 0:
                     # 10 
-                    # valid_div.val = 0.678
-                    # diversity.val = 0.67491
-                    # urscat.val = 86.64319
-                    # auc.val = 274.025
+                    valid_div.val = 0.678
+                    diversity.val = 0.67491
+                    urscat.val = 86.64319
+                    auc.val = 274.025
                     # free
-                    valid_div.val = 0.334
-                    diversity.val = 0.8282
-                    urscat.val = 172.19049
-                    auc.val = 242.065
+                    # valid_div.val = 0.334
+                    # diversity.val = 0.8282
+                    # urscat.val = 172.19049
+                    # auc.val = 242.065
                 else:
                     samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
                     valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples_diversity)
@@ -224,7 +228,7 @@ def main(config: Namespace) -> None:
                
         save_training_checkpoint(
             run_resolution.run_dir,
-            next_epoch=epoch.val,
+            next_epoch=epoch.val+1,
             trainer_state=trainer.training_state_dict(),
             loop_state={
                 "dataset": dataset,
@@ -237,9 +241,12 @@ def main(config: Namespace) -> None:
             epoch += 1
             continue
         
+        print(f"Epoch {epoch.val} starting with dataset size: {len(dataset)} and advantages size: {len(advantages)}")
         with trainer.timer.section("finetune"):
             timed_stats = trainer.finetune(dataset, advantages)
             
+        print(f"Epoch {epoch.val} completed")
+        
         group_stats = {}
         fulltime_stats = {f"full/{k}": np.mean(v) for k, v in timed_stats.items()}
         for i in range(config.num_time_groups):
@@ -260,7 +267,7 @@ def main(config: Namespace) -> None:
             with trainer.timer.section("evaluate_hypervolume"):           
                 samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
                 n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-                energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+                qed.val, sa.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
