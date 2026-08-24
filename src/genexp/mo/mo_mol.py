@@ -4,6 +4,7 @@ import torch
 from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.rewards.utils import graph_to_mols, is_not_fragmented, is_valid, safe_mmff_relax
 from diffusiongym.molecules.rewards.xtb import parallel_xtb
+from posebusters import PoseBusters
 from rdkit import Chem, RDLogger
 from rdkit.Chem import (
     QED,
@@ -16,10 +17,11 @@ from genexp.mo.sa_score import calculateScore
 
 
 class MolecularMetrics(MOReward[DDGraph]):
-    def __init__(self, do_relax: bool = True) -> None:
+    def __init__(self, do_relax: bool = True, full_bust: bool = True) -> None:
         RDLogger.DisableLog("rdApp.*")
         identity_fn = lambda x: x
         self.relax = safe_mmff_relax if do_relax else identity_fn
+        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast")
         self.num_rew = 3
         self.ref_point = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
@@ -44,9 +46,12 @@ class MolecularMetrics(MOReward[DDGraph]):
         valid_mols: list[Chem.Mol] = []
         valid_indices: list[int] = []
         for i, mol in enumerate(mols):
-            if is_valid(mol) and is_not_fragmented(mol): #and posebust
+            if is_valid(mol) and is_not_fragmented(mol):
                 try:
                     relaxed_mol = self.relax(mol)
+                    relaxed_mol_is_busted = self.buster.bust(mol).all(axis=None)
+                    if relaxed_mol_is_busted:
+                        relaxed_mol = None
                 except Exception:  # noqa: BLE001
                     relaxed_mol = None
                 if relaxed_mol is not None:

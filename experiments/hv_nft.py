@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_inner_epochs", type=int, default=1) # currently unused
     parser.add_argument("--only_valids", action="store_true", default=False)
+    parser.add_argument("--full_bust", action="store_true")
 
     parser.add_argument("--timestep_fraction", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -149,7 +150,7 @@ def main(config: Namespace) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
-    reward = MolecularMetrics(do_relax=True)
+    reward = MolecularMetrics(do_relax=True, full_bust=config.full_bust)
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
     unconstrained_sample = env.sample
