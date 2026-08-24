@@ -149,7 +149,7 @@ def main(config: Namespace) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
-    reward = MolecularMetrics(do_relax=False)
+    reward = MolecularMetrics(do_relax=True)
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
     unconstrained_sample = env.sample
