@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resample_every_n_steps", type=int, default=20)
     parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
     parser.add_argument("--evaluate_diversity_every_n_steps", type=int, default=100)
+    parser.add_argument("--evaluate_every_n_steps", type=int, default=5)
     
     parser.add_argument("--num_diversity_samples", type=int, default=1000)
 
@@ -67,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advantage_group_size", type=int, default=16)
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
-    parser.add_argument("--num_integration_steps", type=int, default=40)
+    parser.add_argument("--num_integration_steps", type=int, default=100)
     
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num-time-groups", type=int, default=5)
@@ -149,8 +150,8 @@ def main(config: Namespace) -> None:
     reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
-    unconstrained_sample = env.sample
-    env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
+    # unconstrained_sample = env.sample
+    # env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
 
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
@@ -188,11 +189,17 @@ def main(config: Namespace) -> None:
     for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
-                if epoch.val == 0:
-                    valid_div.val = 0.678
-                    diversity.val = 0.67491
-                    urscat.val = 86.64319
-                    auc.val = 274.025
+                if epoch.val == 2000:
+                    # 10 
+                    # valid_div.val = 0.678
+                    # diversity.val = 0.67491
+                    # urscat.val = 86.64319
+                    # auc.val = 274.025
+                    # free
+                    valid_div.val = 0.334
+                    diversity.val = 0.8282
+                    urscat.val = 172.19049
+                    auc.val = 242.065
                 else:
                     samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
                     valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples_diversity)
@@ -214,8 +221,17 @@ def main(config: Namespace) -> None:
     
                 if dataset:
                     first_var.val = torch.median(fv).item()
-            
-                
+               
+        save_training_checkpoint(
+            run_resolution.run_dir,
+            next_epoch=epoch.val,
+            trainer_state=trainer.training_state_dict(),
+            loop_state={
+                "dataset": dataset,
+                "advantages": advantages,
+            },
+        )
+        
         if not dataset or advantages is None:
             print("No valid dataset or advantages, skipping epoch.")
             epoch += 1
@@ -240,11 +256,11 @@ def main(config: Namespace) -> None:
         
         rows = trainer.timer.summary()
         
-        with trainer.timer.section("evaluate_hypervolume"):           
-            samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-
-        energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+        if epoch.val % config.evaluate_every_n_steps == 0:
+            with trainer.timer.section("evaluate_hypervolume"):           
+                samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+                n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
+                energy.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
@@ -252,15 +268,6 @@ def main(config: Namespace) -> None:
                 f"p50={p50*1e3:7.2f}ms  p95={p95*1e3:7.2f}ms")
 
         epoch += 1
-        save_training_checkpoint(
-            run_resolution.run_dir,
-            next_epoch=epoch.val,
-            trainer_state=trainer.training_state_dict(),
-            loop_state={
-                "dataset": dataset,
-                "advantages": advantages,
-            },
-        )
 
     log.finish()
     mark_run_complete(run_resolution.run_dir)
