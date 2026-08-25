@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.base import MOReward
-from genexp.mo.mo_mol import MolecularMetrics
+from genexp.mo.mo_mol import MolecularMetrics, TopologyMetrics
 from genexp.mo.moses import diversity_metrics
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep_fraction", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-5)
     
-    parser.add_argument("--num_samples", type=int, default=320)
+    parser.add_argument("--num_samples", type=int, default=128)
     parser.add_argument("--advantage_group_size", type=int, default=16)
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-time-groups", type=int, default=5)
     
     parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
+    parser.add_argument("--reward", type=str, choices=["molecular", "topology"], default="molecular")
     return parser.parse_args()
 
 def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
@@ -150,7 +151,10 @@ def main(config: Namespace) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # reward = MOReward(XTBTask(), num_rew=2, ref_point=torch.tensor([-1.0, -1.0], device=device))
-    reward = MolecularMetrics(do_relax=True, full_bust=config.full_bust)
+    if config.reward == "molecular":
+        reward = MolecularMetrics(do_relax=False, full_bust=config.full_bust)
+    elif config.reward == "topology":
+        reward = TopologyMetrics(do_relax=False, full_bust=config.full_bust)
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
     unconstrained_sample = env.sample
@@ -180,7 +184,7 @@ def main(config: Namespace) -> None:
     # energy = log.watch("energy", "epoch")
     qed = log.watch("qed", "epoch")
     sa = log.watch("sa", "epoch")
-    dipole = log.watch("dipole", "epoch")
+    # dipole = log.watch("dipole", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
     valid_div = log.watch("diversity/valid_diversity", "epoch")
     diversity = log.watch("diversity/diversity", "epoch")
@@ -190,34 +194,38 @@ def main(config: Namespace) -> None:
     fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
+    samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+    n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
+    qed.val, sa.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
                 if epoch.val == 0:
                     # 10 
-                    valid_div.val = 0.678
-                    diversity.val = 0.67491
-                    urscat.val = 86.64319
-                    auc.val = 274.025
+                    # valid_div.val = 0.678
+                    # diversity.val = 0.67491
+                    # urscat.val = 86.64319
+                    # auc.val = 274.025
                     # free
-                    # valid_div.val = 0.334
-                    # diversity.val = 0.8282
-                    # urscat.val = 172.19049
-                    # auc.val = 242.065
+                    valid_div.val = 0.334
+                    diversity.val = 0.8282
+                    urscat.val = 172.19049
+                    auc.val = 242.065
                 else:
                     samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
                     valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples_diversity)
         
+        print("a")
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
                 trainer.update_base_model()
-
+        print("b")
         if epoch.val % config.sample_nm1_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("sample_bg"):
                 trainer.fix_optimization_problem()
                 hypervol_X_.val = trainer.hypervolume_X_.median().item()
-
+        print("c")
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
                 dataset, advantages, fv = trainer.generate_dataset_fv()
@@ -226,7 +234,7 @@ def main(config: Namespace) -> None:
     
                 if dataset:
                     first_var.val = torch.median(fv).item()
-               
+        print("d")      
         save_training_checkpoint(
             run_resolution.run_dir,
             next_epoch=epoch.val+1,
@@ -241,7 +249,7 @@ def main(config: Namespace) -> None:
             print("No valid dataset or advantages, skipping epoch.")
             epoch += 1
             continue
-        
+        print("e")
         print(f"Epoch {epoch.val} starting with dataset size: {len(dataset)} and advantages size: {len(advantages)}")
         with trainer.timer.section("finetune"):
             timed_stats = trainer.finetune(dataset, advantages)
@@ -268,7 +276,7 @@ def main(config: Namespace) -> None:
             with trainer.timer.section("evaluate_hypervolume"):           
                 samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
                 n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-                qed.val, sa.val, dipole.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+                qed.val, sa.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:

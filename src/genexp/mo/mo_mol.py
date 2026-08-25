@@ -75,3 +75,57 @@ class MolecularMetrics(MOReward[DDGraph]):
             valids[idx] = True
 
         return rewards, {"valids": valids}
+
+
+class TopologyMetrics(MOReward[DDGraph]):
+    def __init__(self, do_relax: bool = True, full_bust: bool = True) -> None:
+        RDLogger.DisableLog("rdApp.*")
+        identity_fn = lambda x: x
+        self.relax = safe_mmff_relax if do_relax else identity_fn
+        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast")
+        self.num_rew = 2
+        self.ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
+
+    @staticmethod
+    def calculate_qed(rdmol):
+        return QED.qed(rdmol)
+
+    @staticmethod
+    def calculate_sa(rdmol):
+        sa = calculateScore(rdmol)
+        sa_n = (10 - sa) / 9
+        return sa_n
+
+    @staticmethod
+    def calculate_logp(rdmol):
+        return Crippen.MolLogP(rdmol)
+
+    def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        mols = graph_to_mols(sample)
+
+        valid_mols: list[Chem.Mol] = []
+        valid_indices: list[int] = []
+        for i, mol in enumerate(mols):
+            if is_valid(mol) and is_not_fragmented(mol):
+                try:
+                    relaxed_mol = self.relax(mol)
+                    relaxed_mol_is_busted = self.buster.bust(mol).all(axis=None)
+                    if relaxed_mol_is_busted:
+                        relaxed_mol = None
+                except Exception:  # noqa: BLE001
+                    relaxed_mol = None
+                if relaxed_mol is not None:
+                    valid_mols.append(relaxed_mol)
+                    valid_indices.append(i)
+
+
+        rewards = torch.zeros((len(sample), 2), device=sample.device, dtype=torch.float32)
+        valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
+
+        for idx in valid_indices:
+            mol = mols[idx]
+            rewards[idx, 0] = float(self.calculate_qed(mol))
+            rewards[idx, 1] = float(self.calculate_sa(mol))
+            valids[idx] = True
+
+        return rewards, {"valids": valids}
