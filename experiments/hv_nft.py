@@ -122,6 +122,14 @@ def evaluate(samples: list[Sample], reward: MOReward, hv_computer: HVComputer, n
     return n_hypervolume, full_hypervolume, reward_values, valids / len(samples)
 
 
+def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], list[float]]:
+    top_decile_count = ceil(rewards.shape[0] * 0.1)
+    means = rewards.mean(dim=0)
+    top_decile_means = rewards.topk(top_decile_count, dim=0).values.mean(dim=0)
+    top_3_means = rewards.topk(min(3, rewards.shape[0]), dim=0).values.mean(dim=0)
+    return tuple(values.detach().cpu().numpy().tolist() for values in (means, top_decile_means, top_3_means))
+
+
 def main(config: Namespace) -> None:
     assert config.sample_nm1_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.resample_every_n_steps == 0
@@ -183,38 +191,44 @@ def main(config: Namespace) -> None:
     full_hv = log.watch("full_hypervolume", "epoch")
     # energy = log.watch("energy", "epoch")
     qed = log.watch("qed", "epoch")
+    qed_td = log.watch("top_decile/qed_td", "epoch")
+    qed_t3 = log.watch("top_3/qed_t3", "epoch")
     sa = log.watch("sa", "epoch")
+    sa_td = log.watch("top_decile/sa_td", "epoch")
+    sa_t3 = log.watch("top_3/sa_t3", "epoch")
     # dipole = log.watch("dipole", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
-    valid_div = log.watch("diversity/valid_diversity", "epoch")
-    diversity = log.watch("diversity/diversity", "epoch")
-    urscat = log.watch("diversity/vendi_usrcat", "epoch")
-    auc = log.watch("diversity/auc_coverage", "epoch")
+    valid_2d = log.watch("diversity/validity_2d", "epoch")
+    valid_3d = log.watch("diversity/validity_3d", "epoch")
+    diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
+    vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
+    auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
+    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
     first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
     fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
     samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
     n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-    qed.val, sa.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+    (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
     group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(start_epoch, config.epochs)):
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
-                if epoch.val == 0:
-                    # 10 
-                    # valid_div.val = 0.678
-                    # diversity.val = 0.67491
-                    # urscat.val = 86.64319
-                    # auc.val = 274.025
-                    # free
-                    valid_div.val = 0.334
-                    diversity.val = 0.8282
-                    urscat.val = 172.19049
-                    auc.val = 242.065
-                else:
-                    samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-                    valid_div.val, diversity.val, urscat.val, auc.val = diversity_metrics(samples_diversity)
+                samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+                (
+                    valid_2d.val,
+                    diversity_tanimoto.val,
+                    vendi_tanimoto.val,
+                    auc_tanimoto.val,
+                    valid_3d.val,
+                    diversity_usrcat.val,
+                    vendi_usrcat.val,
+                    auc_usrcat.val,
+                ) = diversity_metrics(samples_diversity)
+
         
         print("a")
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
@@ -276,7 +290,7 @@ def main(config: Namespace) -> None:
             with trainer.timer.section("evaluate_hypervolume"):           
                 samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
                 n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-                qed.val, sa.val = rewards.mean(dim=0).detach().cpu().numpy().tolist()
+                (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
