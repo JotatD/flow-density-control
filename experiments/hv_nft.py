@@ -30,52 +30,56 @@ from genexp.wandb_log import WandbLogger
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    
+    #loggin
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--force_new_start", action="store_true")
-    parser.add_argument("--name", type=str, default="hv_dxtb_test2")
     parser.add_argument("--project_name", type=str, default="whos_back")
-
     parser.add_argument("--run_name", type=str, default="hv_nft")
-
     parser.add_argument("--seed", type=int, default=5)
 
+    #algorithm and problem
+    parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
+    parser.add_argument("--reward", type=str, choices=["molecular", "topology"], default="topology")
+    
+    #hyper param
     parser.add_argument("--n", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--alpha", type=float, default=10)
     parser.add_argument("--beta", type=float, default=1)
-    parser.add_argument("--exploration_decay_type", type=int, choices=(0, 1, 2), default=1)
-
-    parser.add_argument("--num_p_nm1", type=int, default=85)
-
-    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=20)
-    parser.add_argument("--resample_every_n_steps", type=int, default=20)
-    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
-    parser.add_argument("--evaluate_diversity_every_n_steps", type=int, default=20)
-    parser.add_argument("--evaluate_every_n_steps", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=5e-5)
     
-    parser.add_argument("--num_diversity_samples", type=int, default=1000)
-
-    parser.add_argument("--batch_size", type=int, default=40)
     parser.add_argument("--adv_clip_max", type=float, default=5.0)
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_inner_epochs", type=int, default=1) # currently unused
-    parser.add_argument("--only_valids", action="store_true", default=False)
-    parser.add_argument("--full_bust", action="store_true")
+    parser.add_argument("--num_integration_steps", type=int, default=100)
 
-    parser.add_argument("--timestep_fraction", type=float, default=0.99)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    #every n step
+    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=20)
+    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
+    parser.add_argument("--resample_every_n_steps", type=int, default=20)
     
-    parser.add_argument("--num_samples", type=int, default=128)
-    parser.add_argument("--advantage_group_size", type=int, default=16)
+    #size
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--num_samples", type=int, default=20)
+    parser.add_argument("--num_p_nm1", type=int, default=40)
+    parser.add_argument("--vol_samples", type=int, default=60)
+    parser.add_argument("--num_diversity_samples", type=int, default=300)
+
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
-    parser.add_argument("--num_integration_steps", type=int, default=100)
     
-    parser.add_argument("--vol_samples", type=int, default=128)
-    parser.add_argument("--num-time-groups", type=int, default=5)
+    #eval every
+    parser.add_argument("--evaluate_diversity_every_n_steps", type=int, default=20)
+    parser.add_argument("--evaluate_every_n_steps", type=int, default=5)
     
-    parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
-    parser.add_argument("--reward", type=str, choices=["molecular", "topology"], default="molecular")
+    #modifiers
+    parser.add_argument("--full_bust", action="store_true")
+    parser.add_argument("--only_valids", action="store_true", default=False)
+
+    
+    parser.add_argument("--num-time-groups", type=int, default=2)
+    
     return parser.parse_args()
 
 def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
@@ -213,34 +217,22 @@ def main(config: Namespace) -> None:
         samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
         n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
         (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-    group_length = ceil((config.num_integration_steps-1) / config.num_time_groups)
     for _ in tqdm(range(start_epoch, config.epochs)):
         epoch += 1
         if epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with trainer.timer.section("evaluate_diversity"):
-                if epoch.val == 0:
-                    valid_2d.val = 0.721
-                    diversity_tanimoto.val = 0.887
-                    vendi_tanimoto.val = 221.31525
-                    auc_tanimoto.val = 382.86
-                    valid_3d.val = 0.32
-                    diversity_usrcat.val = 0.67587
-                    vendi_usrcat.val = 89.58255
-                    auc_usrcat.val = 290.96
-                else:
-                    samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-                    (
-                        valid_2d.val,
-                        diversity_tanimoto.val,
-                        vendi_tanimoto.val,
-                        auc_tanimoto.val,
-                        valid_3d.val,
-                        diversity_usrcat.val,
-                        vendi_usrcat.val,
-                        auc_usrcat.val,
-                    ) = diversity_metrics(samples_diversity)
+                samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+                (
+                    valid_2d.val,
+                    diversity_tanimoto.val,
+                    vendi_tanimoto.val,
+                    auc_tanimoto.val,
+                    valid_3d.val,
+                    diversity_usrcat.val,
+                    vendi_usrcat.val,
+                    auc_usrcat.val,
+                ) = diversity_metrics(samples_diversity)
 
-        
         print("a")
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with trainer.timer.section("update_base_model"):
@@ -253,6 +245,7 @@ def main(config: Namespace) -> None:
         print("c")
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
+                trainer.update_exploration_model()
                 dataset, advantages, fv = trainer.generate_dataset_fv()
                 
                 fulfillment.val = len(dataset) / config.num_samples
@@ -280,20 +273,18 @@ def main(config: Namespace) -> None:
             
         print(f"Epoch {epoch.val} completed")
         
-        group_stats = {}
         fulltime_stats = {f"full/{k}": np.mean(v) for k, v in timed_stats.items()}
-        for i in range(config.num_time_groups):
-            start = i * group_length
-            end = min((i + 1) * group_length, config.num_integration_steps-1) 
-            print(start, end)   
-            for k in timed_stats:
-                group_stats[f"{i}_group/{k}"] = np.mean(timed_stats[k][start:end])
-            
-        log.log_dict(group_stats, 'epoch')
         log.log_dict(fulltime_stats, 'epoch')
         
-        trainer.update_exploration_model()
-        
+        # group_stats = {}
+        # for i in range(config.num_time_groups):
+        #     for k in timed_stats:
+        #         group_length = ceil(len(timed_stats[k]) / config.num_time_groups)
+        #         start = i * group_length
+        #         end = min((i + 1) * group_length, config.num_integration_steps-1) 
+        #         group_stats[f"{i}_group/{k}"] = np.mean(timed_stats[k][start:end])
+        # log.log_dict(group_stats, 'epoch')
+                    
         rows = trainer.timer.summary()
         
         if epoch.val % config.evaluate_every_n_steps == 0:

@@ -15,7 +15,7 @@ import torch
 
 MANIFEST_NAME = "run_manifest.json"
 CHECKPOINT_PREFIX = "training_state_epoch_"
-CONFIG_EXCLUSIONS = {"epochs", "force_new_start", "evaluate_diversity_every_n_steps", "evaluate_every_n_steps"}
+CONFIG_EXCLUSIONS = {"epochs", "force_new_start", "evaluate_diversity_every_n_steps", "evaluate_every_n_steps", "batch_size", "timestep_fraction"}
 
 
 @dataclass(frozen=True)

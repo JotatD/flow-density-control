@@ -19,53 +19,17 @@ from genexp.trainers.utils import StepTimer
 
 class RewardStatTracker:
     """Normalize rewards within contiguous groups."""
-
-    def __init__(self, advantage_group_size: int = 16):
-        self.advantage_group_size = advantage_group_size
-
+    def __init__(self,):
+        self.mean = 0.0
+        self.std = 1.0
+        
     def update(self, rewards: torch.Tensor) -> torch.Tensor:
         rewards = rewards.detach()
-        batch_size = rewards.shape[0]
-        group_size = self.advantage_group_size
-        greatest_multiple = (batch_size // group_size) * group_size
-        normalized_parts = []
-        if greatest_multiple > 0:
-            rewards_batch = rewards[:greatest_multiple]
-            rewards_batch = rewards_batch.reshape(-1, group_size)
-
-            rewards_mean = rewards_batch.mean(dim=1, keepdim=True)
-            rewards_std = rewards_batch.std(dim=1, keepdim=True, correction=0)
-            rewards_batch = (rewards_batch - rewards_mean) / (rewards_std + 1e-4)
-            normalized_parts.append(rewards_batch.reshape(-1))
-
-        # Normalize remaining incomplete group
-        last_batch = rewards[greatest_multiple:]
-        if last_batch.numel() > 0:
-            last_batch_mean = last_batch.mean()
-            last_batch_std = last_batch.std(correction=0)
-            last_batch = (last_batch - last_batch_mean) / (last_batch_std + 1e-4)
-            normalized_parts.append(last_batch)
-
-        if not normalized_parts:
-            return rewards
-
-        return torch.cat(normalized_parts, dim=0)
-
-
-def exploration_decay(step: int, decay_type: int) -> float:
-    """Return the exploration-policy EMA decay used by DiffusionNFT."""
-    if decay_type == 0:
-        flat, rate, maximum = 0, 0.0, 0.0
-    elif decay_type == 1:
-        flat, rate, maximum = 0, 0.001, 0.5
-    elif decay_type == 2:
-        flat, rate, maximum = 75, 0.0075, 0.999
-    else:
-        raise ValueError(f"Unknown exploration decay type: {decay_type}")
-
-    if step < flat:
-        return 0.0
-    return min((step - flat) * rate, maximum)
+        self.mean = rewards.mean()
+        self.std = rewards.std(correction=0)
+        rewards = (rewards - self.mean) / (self.std + 1e-4)
+        return rewards
+    
 
 
 def endpoint(model: BaseModel[D], vt: D, xt: D, t: torch.Tensor) -> D:
@@ -124,11 +88,12 @@ class DiffusionNFTrainer:
         self.adv_clip_max: float = config.adv_clip_max
         self.clip_grad_norm: float = config.clip_grad_norm
         self.num_inner_epochs: int = config.num_inner_epochs
-        self.timestep_fraction: float = config.timestep_fraction
+        # self.timestep_fraction: float = config.timestep_fraction
+        # print(self.timestep_fraction)
 
         self.mixing_beta: float = config.beta
         self.kl_weight: float = config.alpha
-        self.exploration_decay_type: int = config.exploration_decay_type
+        # self.exploration_decay_type: int = config.exploration_decay_type
 
         self.env = env
         self.base_model = base_model
@@ -137,7 +102,7 @@ class DiffusionNFTrainer:
         self.fine_model = env.model
         self.exploration_model = copy.deepcopy(self.base_model)
         self.exploration_model.requires_grad_(False)
-        self.reward_stat_tracker = RewardStatTracker(config.advantage_group_size)
+        self.reward_stat_tracker = RewardStatTracker()
         self.optimizer_steps = 0
         self.fulfill_max_attempts = config.fulfill_max_attempts
         
@@ -159,11 +124,7 @@ class DiffusionNFTrainer:
             "base_model": self.base_model.state_dict(),
             "exploration_model": self.exploration_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "optimizer_steps": self.optimizer_steps,
-            # "reward_stat_tracker": {
-            #     "mean": self.reward_stat_tracker.mean,
-            #     "std": self.reward_stat_tracker.std,
-            # },
+            "optimizer_steps": self.optimizer_steps
         }
 
     def load_training_state_dict(self, state: dict[str, Any]) -> None:
@@ -173,9 +134,6 @@ class DiffusionNFTrainer:
         self.exploration_model.load_state_dict(state["exploration_model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.optimizer_steps = state["optimizer_steps"]
-        # reward_stat_tracker = state["reward_stat_tracker"]
-        # self.reward_stat_tracker.mean = reward_stat_tracker["mean"]
-        # self.reward_stat_tracker.std = reward_stat_tracker["std"]
 
     def generate_dataset(self, reward: Reward[D]) -> tuple[list[Sample], torch.Tensor, torch.Tensor]:
         """Collect exploration-policy samples and normalize their rewards."""
@@ -190,8 +148,8 @@ class DiffusionNFTrainer:
         self.env.policy = self.exploration_model
         try:
             while remaining > 0 and self.curr_attempts < self.fulfill_max_attempts:
-                batch = self.batch_size if self.fulfill else min(self.batch_size, remaining)
-                env_sample = self.env.sample(batch, pbar=False)
+                batch = min(self.batch_size,  5*remaining) if self.fulfill else min(self.batch_size, remaining)
+                env_sample = self.env.sample(batch, pbar=True)
                 rewards, info = reward(env_sample.sample, env_sample.latent)
                 self.curr_attempts += batch
                 for i, sample in enumerate(env_sample):  # ty: ignore[invalid-argument-type]
@@ -230,12 +188,7 @@ class DiffusionNFTrainer:
         }
 
         T = self.env.discretization_steps
-        if self.timestep_fraction < 1.0 and self.timestep_fraction > 0.0:
-            sp = max(0.0, self.timestep_fraction - 0.25)
-            idxs = create_timestep_subset(T, final_percent=0.25, sample_percent=sp)
-        else:
-            idxs = np.arange(T)
-
+        idxs = np.arange(T)
         adv_clipped = torch.clamp(advantages, -self.adv_clip_max, self.adv_clip_max)
         normalized_advantages_clip = 0.5 * (adv_clipped / self.adv_clip_max) + 0.5
         r = torch.clamp(normalized_advantages_clip, 0, 1).to(self.device)
@@ -323,13 +276,7 @@ class DiffusionNFTrainer:
     @torch.no_grad()
     def update_exploration_model(self) -> None:
         """Update the exploration policy from the fine policy using the configured EMA."""
-        decay = exploration_decay(self.optimizer_steps, self.exploration_decay_type)
-        for fine_parameter, exploration_parameter in zip(
-            self.fine_model.parameters(),
-            self.exploration_model.parameters(),
-            strict=True,
-        ):
-            exploration_parameter.lerp_(fine_parameter, 1.0 - decay)
+        self.exploration_model.load_state_dict(self.fine_model.state_dict())
 
 
 class HVRL(DiffusionNFTrainer):
@@ -359,7 +306,6 @@ class HVRL(DiffusionNFTrainer):
         self.num_p_nm1 = config.num_p_nm1
         
         self.scalarization = config.scalarization
-
         super().__init__(
             config,
             env,
