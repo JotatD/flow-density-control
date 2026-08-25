@@ -55,8 +55,7 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--num_diversity_samples", type=int, default=1000)
 
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--clip_range", type=float, default=0.2)
+    parser.add_argument("--batch_size", type=int, default=40)
     parser.add_argument("--adv_clip_max", type=float, default=5.0)
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_inner_epochs", type=int, default=1) # currently unused
@@ -70,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advantage_group_size", type=int, default=16)
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
-    parser.add_argument("--num_integration_steps", type=int, default=40)
+    parser.add_argument("--num_integration_steps", type=int, default=100)
     
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num-time-groups", type=int, default=5)

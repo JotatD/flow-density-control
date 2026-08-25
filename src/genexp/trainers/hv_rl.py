@@ -121,7 +121,6 @@ class DiffusionNFTrainer:
         self.batch_size: int = config.batch_size
 
         self.use_valids = use_valids
-        self.clip_range: float = config.clip_range
         self.adv_clip_max: float = config.adv_clip_max
         self.clip_grad_norm: float = config.clip_grad_norm
         self.num_inner_epochs: int = config.num_inner_epochs
