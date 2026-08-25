@@ -21,7 +21,7 @@ class MolecularMetrics(MOReward[DDGraph]):
         RDLogger.DisableLog("rdApp.*")
         identity_fn = lambda x: x
         self.relax = safe_mmff_relax if do_relax else identity_fn
-        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast")
+        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast", max_workers=None)
         self.num_rew = 3
         self.ref_point = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
 
@@ -82,7 +82,7 @@ class TopologyMetrics(MOReward[DDGraph]):
         RDLogger.DisableLog("rdApp.*")
         identity_fn = lambda x: x
         self.relax = safe_mmff_relax if do_relax else identity_fn
-        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast")
+        self.buster = PoseBusters(config="mol" if full_bust else "mol_fast", max_workers=None)
         self.num_rew = 2
         self.ref_point = torch.tensor([0.0, 0.0], dtype=torch.float32)
 
@@ -109,16 +109,15 @@ class TopologyMetrics(MOReward[DDGraph]):
             if is_valid(mol) and is_not_fragmented(mol):
                 try:
                     relaxed_mol = self.relax(mol)
-                    relaxed_mol_is_busted = self.buster.bust(mol).all(axis=None)
-                    if relaxed_mol_is_busted:
-                        relaxed_mol = None
                 except Exception:  # noqa: BLE001
                     relaxed_mol = None
                 if relaxed_mol is not None:
                     valid_mols.append(relaxed_mol)
-                    valid_indices.append(i)
-
-
+                    valid_indices.append(i)    
+                    
+        valids = self.buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
+        valid_indices = [idx for idx, is_valid in zip(valid_indices, valids) if is_valid]
+        
         rewards = torch.zeros((len(sample), 2), device=sample.device, dtype=torch.float32)
         valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
 

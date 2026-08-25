@@ -46,14 +46,9 @@ def diversity_metrics(samples: list[Sample[DDGraph]]) -> tuple[float, float, flo
     auc_coverage_tanimoto = auc(tanimoto_similarity)    
 
     buster = PoseBusters(config="mol")
-    buster.bust(mol).all(axis=None)
-    
-    # 3d metrics
-    conformer_valid_mols = []
-    for mol in valid_mols:
-        if buster.bust(mol).all(axis=None):
-            conformer_valid_mols.append(mol)
-            
+    busting = buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
+    conformer_valid_mols = [mol for mol, is_valid in zip(valid_mols, busting) if is_valid]
+
     validity_3d = len(conformer_valid_mols) / len(mols)
     
     if len(conformer_valid_mols) <= 1:
