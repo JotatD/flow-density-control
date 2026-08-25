@@ -5,11 +5,12 @@ from diffusiongym.molecules.types import DDGraph
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdMolDescriptors
 from vendi_score.vendi import score_K
-
+from posebusters import PoseBusters
 
 def diversity_metrics(samples: list[Sample[DDGraph]]) -> tuple[float, float, float, float, float, float, float, float]:
     sample = Sample.concat(samples).sample
     mols: list[Chem.Mol] = graph_to_mols(sample)
+    
 
     valid_mols: list[Chem.Mol] = []
     for mol in mols:
@@ -44,11 +45,13 @@ def diversity_metrics(samples: list[Sample[DDGraph]]) -> tuple[float, float, flo
 
     auc_coverage_tanimoto = auc(tanimoto_similarity)    
 
-
+    buster = PoseBusters(config="mol")
+    buster.bust(mol).all(axis=None)
+    
     # 3d metrics
     conformer_valid_mols = []
     for mol in valid_mols:
-        if is_valid(mol) and is_not_fragmented(mol):
+        if buster.bust(mol).all(axis=None):
             conformer_valid_mols.append(mol)
             
     validity_3d = len(conformer_valid_mols) / len(mols)

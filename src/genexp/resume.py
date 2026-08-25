@@ -15,7 +15,7 @@ import torch
 
 MANIFEST_NAME = "run_manifest.json"
 CHECKPOINT_PREFIX = "training_state_epoch_"
-CONFIG_EXCLUSIONS = {"epochs", "force_new_start"}
+CONFIG_EXCLUSIONS = {"epochs", "force_new_start", "evaluate_diversity_every_n_steps", "evaluate_every_n_steps"}
 
 
 @dataclass(frozen=True)
@@ -58,8 +58,13 @@ def resolve_run(config, results_root: Path, run_prefix: str) -> RunResolution:
         matches = []
         for manifest_path in results_root.glob(f"*/{MANIFEST_NAME}"):
             manifest = _read_manifest(manifest_path)
-            if manifest is None or manifest.get("configuration") != configuration:
+            if manifest is None:
                 continue
+            if manifest.get("configuration"):
+                temp_config = manifest.get("configuration")
+                candidate = {key: value for key, value in temp_config.items() if key not in CONFIG_EXCLUSIONS}
+                if configuration != candidate:
+                    continue
             matches.append((manifest.get("created_at", ""), manifest_path, manifest))
 
         if matches:
