@@ -113,13 +113,16 @@ class TopologyMetrics(MOReward[DDGraph]):
                     relaxed_mol = None
                 if relaxed_mol is not None:
                     valid_mols.append(relaxed_mol)
-                    valid_indices.append(i)    
-                    
-        valids = self.buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
-        valid_indices = [idx for idx, is_valid in zip(valid_indices, valids) if is_valid]
-        
+                    valid_indices.append(i)
+
         rewards = torch.zeros((len(sample), 2), device=sample.device, dtype=torch.float32)
         valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
+
+        if not valid_mols:
+            return rewards, {"valids": valids}
+
+        posebuster_valids = self.buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
+        valid_indices = [idx for idx, is_valid in zip(valid_indices, posebuster_valids) if is_valid]
 
         for idx in valid_indices:
             mol = mols[idx]
