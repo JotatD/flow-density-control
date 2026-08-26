@@ -55,11 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_integration_steps", type=int, default=100)
 
     #every n step
-    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=20)
-    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
-    parser.add_argument("--resample_every_n_steps", type=int, default=20)
+    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=10)
+    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=10)
+    parser.add_argument("--resample_every_n_steps", type=int, default=10)
     
-    parser.add_argument("--save_every_n_steps", type=int, default=20)
+    parser.add_argument("--save_every_n_steps", type=int, default=10)
     
     #size
     parser.add_argument("--batch_size", type=int, default=64)
