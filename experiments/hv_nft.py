@@ -80,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     #modifiers
     parser.add_argument("--full_bust", action="store_true")
     parser.add_argument("--only_valids", action="store_true", default=False)
+    parser.add_argument("--exploration_decay_type", type=int, choices=[0, 1, 2], default=1)
 
     #logging
     parser.add_argument("--num-time-groups", type=int, default=2)
@@ -252,7 +253,6 @@ def main(config: Namespace) -> None:
         print("c")
         if epoch.val % config.resample_every_n_steps == 0:
             with trainer.timer.section("generate_dataset"):
-                trainer.update_exploration_model()
                 dataset, advantages, fv = trainer.generate_dataset_fv()
                 
                 fulfillment.val = len(dataset) / config.num_samples
@@ -280,6 +280,8 @@ def main(config: Namespace) -> None:
         #         end = min((i + 1) * group_length, config.num_integration_steps-1) 
         #         group_stats[f"{i}_group/{k}"] = np.mean(timed_stats[k][start:end])
         # log.log_dict(group_stats, 'epoch')
+        
+        trainer.update_exploration_model()
                     
         rows = trainer.timer.summary()
         
