@@ -89,6 +89,7 @@ class WandbLogger:
             if step_metric in self.step_metrics:
                 di.update({step_metric: self.step_metrics[step_metric]})
             wandb.log(di)
+            print(f"{name}: {val}")
         return NumericSentinel(name, call_fn=call_fn)
 
         

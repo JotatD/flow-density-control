@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     #loggin
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--force_new_start", action="store_true")
-    parser.add_argument("--project_name", type=str, default="whos_back")
+    parser.add_argument("--project_name", type=str, default="semi_bust")
     parser.add_argument("--run_name", type=str, default="hv_nft")
     parser.add_argument("--seed", type=int, default=5)
 
@@ -59,10 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_nm1_every_n_steps", type=int, default=20)
     parser.add_argument("--resample_every_n_steps", type=int, default=20)
     
+    parser.add_argument("--save_every_n_steps", type=int, default=20)
+    
     #size
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_samples", type=int, default=30)
-    parser.add_argument("--advantage_group_size", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--num_samples", type=int, default=256)
+    parser.add_argument("--advantage_group_size", type=int, default=16)
     parser.add_argument("--num_p_nm1", type=int, default=60)
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--num_diversity_samples", type=int, default=256)
@@ -218,25 +220,25 @@ def main(config: Namespace) -> None:
     fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
-    # if epoch.val == -1:
-    #     samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-    #     n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-    #     (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
+    if epoch.val == -1:
+        samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+        n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
+        (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
     for _ in tqdm(range(start_epoch, config.epochs)):
         epoch += 1
-        # if epoch.val % config.evaluate_diversity_every_n_steps == 0:
-        #     with trainer.timer.section("evaluate_diversity"):
-        #         samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-        #         (
-        #             valid_2d.val,
-        #             diversity_tanimoto.val,
-        #             vendi_tanimoto.val,
-        #             auc_tanimoto.val,
-        #             valid_3d.val,
-        #             diversity_usrcat.val,
-        #             vendi_usrcat.val,
-        #             auc_usrcat.val,
-        #         ) = diversity_metrics(samples_diversity)
+        if epoch.val % config.evaluate_diversity_every_n_steps == 0:
+            with trainer.timer.section("evaluate_diversity"):
+                samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+                (
+                    valid_2d.val,
+                    diversity_tanimoto.val,
+                    vendi_tanimoto.val,
+                    auc_tanimoto.val,
+                    valid_3d.val,
+                    diversity_usrcat.val,
+                    vendi_usrcat.val,
+                    auc_usrcat.val,
+                ) = diversity_metrics(samples_diversity, full_bust=config.full_bust)
 
         print("a")
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
@@ -256,18 +258,7 @@ def main(config: Namespace) -> None:
                 fulfillment.val = len(dataset) / config.num_samples
     
                 if dataset:
-                    first_var.val = torch.median(fv).item()
-        print("d")      
-        save_training_checkpoint(
-            run_resolution.run_dir,
-            next_epoch=epoch.val+1,
-            trainer_state=trainer.training_state_dict(),
-            loop_state={
-                "dataset": dataset,
-                "advantages": advantages,
-            },
-        )
-        
+                    first_var.val = torch.median(fv).item()        
         if not dataset or advantages is None:
             print("No valid dataset or advantages, skipping epoch.")
             continue
@@ -303,6 +294,16 @@ def main(config: Namespace) -> None:
             print(f"{name:30s}  n={cnt:5d}  total={total:8.3f}s  mean={mean*1e3:7.2f}ms  "
                 f"p50={p50*1e3:7.2f}ms  p95={p95*1e3:7.2f}ms")
 
+        if epoch.val % config.save_every_n_steps == 0:            
+            save_training_checkpoint(
+                run_resolution.run_dir,
+                next_epoch=epoch.val+1,
+                trainer_state=trainer.training_state_dict(),
+                loop_state={
+                    "dataset": dataset,
+                    "advantages": advantages,
+                },
+            )
 
     log.finish()
     mark_run_complete(run_resolution.run_dir)

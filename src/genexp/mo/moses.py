@@ -7,7 +7,7 @@ from rdkit.Chem import rdMolDescriptors
 from vendi_score.vendi import score_K
 from posebusters import PoseBusters
 
-def diversity_metrics(samples: list[Sample[DDGraph]]) -> tuple[float, float, float, float, float, float, float, float]:
+def diversity_metrics(samples: list[Sample[DDGraph]], full_bust: bool = False) -> tuple[float, float, float, float, float, float, float, float]:
     sample = Sample.concat(samples).sample
     mols: list[Chem.Mol] = graph_to_mols(sample)
     
@@ -45,7 +45,7 @@ def diversity_metrics(samples: list[Sample[DDGraph]]) -> tuple[float, float, flo
 
     auc_coverage_tanimoto = auc(tanimoto_similarity)    
 
-    buster = PoseBusters(config="mol")
+    buster = PoseBusters(config="mol" if full_bust else "mol_fast")
     busting = buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
     conformer_valid_mols = [mol for mol, is_valid in zip(valid_mols, busting) if is_valid]
 
