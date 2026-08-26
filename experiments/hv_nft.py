@@ -62,13 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_every_n_steps", type=int, default=20)
     
     #size
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--num_samples", type=int, default=256)
-    parser.add_argument("--advantage_group_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_samples", type=int, default=64)
+    parser.add_argument("--advantage_group_size", type=int, default=8)
     parser.add_argument("--num_p_nm1", type=int, default=60)
-    parser.add_argument("--vol_samples", type=int, default=128)
-    parser.add_argument("--num_diversity_samples", type=int, default=256)
-    parser.add_argument("--timestep_fraction", type=float, default=0.5)
+    parser.add_argument("--vol_samples", type=int, default=64)
+    parser.add_argument("--num_diversity_samples", type=int, default=128)
+    parser.add_argument("--timestep_fraction", type=float, default=0.50)
 
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
@@ -175,8 +175,8 @@ def main(config: Namespace) -> None:
         reward = TopologyMetrics(do_relax=False, full_bust=config.full_bust)
     model = GEOMBaseModel(device=device)
     env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
-    unconstrained_sample = env.sample
-    env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
+    # unconstrained_sample = env.sample
+    # env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
 
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
