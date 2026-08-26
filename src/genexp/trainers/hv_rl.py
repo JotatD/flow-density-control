@@ -19,18 +19,44 @@ from genexp.trainers.utils import StepTimer
 
 class RewardStatTracker:
     """Normalize rewards within contiguous groups."""
-    def __init__(self,):
-        self.mean = 0.0
-        self.std = 1.0
-        
+
+    def __init__(self, advantage_group_size: int = 16):
+        self.advantage_group_size = advantage_group_size
+
     def update(self, rewards: torch.Tensor) -> torch.Tensor:
         rewards = rewards.detach()
-        self.mean = rewards.mean()
-        self.std = rewards.std(correction=0)
-        rewards = (rewards - self.mean) / (self.std + 1e-4)
-        return rewards
-    
+        batch_size = rewards.shape[0]
+        group_size = self.advantage_group_size
+        greatest_multiple = (batch_size // group_size) * group_size
+        normalized_parts = []
+        if greatest_multiple > 0:
+            rewards_batch = rewards[:greatest_multiple]
+            rewards_batch = rewards_batch.reshape(-1, group_size)
 
+            rewards_mean = rewards_batch.mean(dim=1, keepdim=True)
+            rewards_std = rewards_batch.std(dim=1, keepdim=True, correction=0)
+            rewards_batch = (rewards_batch - rewards_mean) / (rewards_std + 1e-4)
+            normalized_parts.append(rewards_batch.reshape(-1))
+
+        # Normalize remaining incomplete group
+        last_batch = rewards[greatest_multiple:]
+        if last_batch.numel() > 0:
+            last_batch_mean = last_batch.mean()
+            last_batch_std = last_batch.std(correction=0)
+            last_batch = (last_batch - last_batch_mean) / (last_batch_std + 1e-4)
+            normalized_parts.append(last_batch)
+
+        if not normalized_parts:
+            return rewards
+
+        return torch.cat(normalized_parts, dim=0)
+
+
+def subsample_steps(total_steps, percentage):
+    """Create a subset of time-steps for efficient computation (Appendix G2)."""
+    steps_count = int(total_steps * percentage)
+    samples = np.random.choice(np.arange(total_steps), size=steps_count, replace=False)
+    return np.sort(samples)
 
 def endpoint(model: BaseModel[D], vt: D, xt: D, t: torch.Tensor) -> D:
     """Recover the clean endpoint from an interpolant state and velocity."""
@@ -88,8 +114,9 @@ class DiffusionNFTrainer:
         self.adv_clip_max: float = config.adv_clip_max
         self.clip_grad_norm: float = config.clip_grad_norm
         self.num_inner_epochs: int = config.num_inner_epochs
-        # self.timestep_fraction: float = config.timestep_fraction
-        # print(self.timestep_fraction)
+        self.advantage_group_size: int = config.advantage_group_size
+        
+        self.timestep_fraction: float = config.timestep_fraction
 
         self.mixing_beta: float = config.beta
         self.kl_weight: float = config.alpha
@@ -102,7 +129,7 @@ class DiffusionNFTrainer:
         self.fine_model = env.model
         self.exploration_model = copy.deepcopy(self.base_model)
         self.exploration_model.requires_grad_(False)
-        self.reward_stat_tracker = RewardStatTracker()
+        self.reward_stat_tracker = RewardStatTracker(advantage_group_size=self.advantage_group_size)
         self.optimizer_steps = 0
         self.fulfill_max_attempts = config.fulfill_max_attempts
         
@@ -187,14 +214,18 @@ class DiffusionNFTrainer:
             'old_deviate_max': [],
         }
 
+        # idxs = np.arange(T)
+        
         T = self.env.discretization_steps
-        idxs = np.arange(T)
+        idxs = subsample_steps(T, self.timestep_fraction)
         adv_clipped = torch.clamp(advantages, -self.adv_clip_max, self.adv_clip_max)
         normalized_advantages_clip = 0.5 * (adv_clipped / self.adv_clip_max) + 0.5
         r = torch.clamp(normalized_advantages_clip, 0, 1).to(self.device)
 
-        losses = []
+        self.optimizer.zero_grad()
+        num_timesteps = len(idxs)
         for idx in idxs:
+            print(idx)
             t_batch = timesteps[idx].unsqueeze(0).expand(len(clean_latent))
             noise = clean_latent.randn_like().to(self.device)
             interpolant_alpha = self.base_model.scheduler.alpha(clean_latent, t_batch)
@@ -230,8 +261,6 @@ class DiffusionNFTrainer:
             kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean()
             loss = policy_loss + self.kl_weight * kl_div_loss
 
-            losses.append(loss)
-            
             timed_statistics['policy_loss'].append(policy_loss.item())
             timed_statistics['unweighted_policy_loss'].append(ori_policy_loss.mean().item())
             timed_statistics['kl_div_loss'].append(kl_div_loss.item())
@@ -242,13 +271,12 @@ class DiffusionNFTrainer:
             timed_statistics['old_deviate'].append(((old_prediction - forward_prediction) ** 2).aggregate("mean").mean().item())
             timed_statistics['old_deviate_max'].append(((old_prediction - forward_prediction) ** 2).aggregate("max").mean().item())
 
-        loss = torch.stack(losses).mean()
-    
-        if loss.isnan():
-            return {}
+            if loss.isnan():
+                self.optimizer.zero_grad()
+                return {}
 
-        self.optimizer.zero_grad()
-        loss.backward()
+            (loss / num_timesteps).backward()
+
         if self.clip_grad_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.fine_model.parameters(), self.clip_grad_norm)
         self.optimizer.step()

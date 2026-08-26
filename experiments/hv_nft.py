@@ -60,11 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resample_every_n_steps", type=int, default=20)
     
     #size
-    parser.add_argument("--batch_size", type=int, default=20)
-    parser.add_argument("--num_samples", type=int, default=20)
-    parser.add_argument("--num_p_nm1", type=int, default=40)
-    parser.add_argument("--vol_samples", type=int, default=60)
-    parser.add_argument("--num_diversity_samples", type=int, default=300)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--num_samples", type=int, default=30)
+    parser.add_argument("--advantage_group_size", type=int, default=10)
+    parser.add_argument("--num_p_nm1", type=int, default=60)
+    parser.add_argument("--vol_samples", type=int, default=128)
+    parser.add_argument("--num_diversity_samples", type=int, default=256)
+    parser.add_argument("--timestep_fraction", type=float, default=0.5)
 
     parser.add_argument("--fulfill_num_samples", action="store_true")
     parser.add_argument("--fulfill_max_attempts", type=int, default=10_000)
@@ -77,8 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full_bust", action="store_true")
     parser.add_argument("--only_valids", action="store_true", default=False)
 
-    
+    #logging
     parser.add_argument("--num-time-groups", type=int, default=2)
+    
+    #extra complexity
+    
     
     return parser.parse_args()
 
@@ -213,25 +218,25 @@ def main(config: Namespace) -> None:
     fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
-    if epoch.val == -1:
-        samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-        n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
-        (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
+    # if epoch.val == -1:
+    #     samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
+    #     n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(samples_eval, reward, hv_computer, n=config.n)
+    #     (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
     for _ in tqdm(range(start_epoch, config.epochs)):
         epoch += 1
-        if epoch.val % config.evaluate_diversity_every_n_steps == 0:
-            with trainer.timer.section("evaluate_diversity"):
-                samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-                (
-                    valid_2d.val,
-                    diversity_tanimoto.val,
-                    vendi_tanimoto.val,
-                    auc_tanimoto.val,
-                    valid_3d.val,
-                    diversity_usrcat.val,
-                    vendi_usrcat.val,
-                    auc_usrcat.val,
-                ) = diversity_metrics(samples_diversity)
+        # if epoch.val % config.evaluate_diversity_every_n_steps == 0:
+        #     with trainer.timer.section("evaluate_diversity"):
+        #         samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
+        #         (
+        #             valid_2d.val,
+        #             diversity_tanimoto.val,
+        #             vendi_tanimoto.val,
+        #             auc_tanimoto.val,
+        #             valid_3d.val,
+        #             diversity_usrcat.val,
+        #             vendi_usrcat.val,
+        #             auc_usrcat.val,
+        #         ) = diversity_metrics(samples_diversity)
 
         print("a")
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
