@@ -61,23 +61,8 @@ class HVRL(DiffusionNFTrainer):
 
     def fix_optimization_problem(self):
         with torch.no_grad():
-            # check if the file exists otherwise create and save
-            try:
-                with open('evaluations_X_.pkl', 'rb') as f:
-                    self.evaluations_X_ = pkl.load(f).to('cpu')
-                with open('hypervolume_X_.pkl', 'rb') as f:
-                    self.hypervolume_X_ = pkl.load(f).to('cpu')
-                print("Loaded evaluations_X_ and hypervolume_X_ from files.")
-            except FileNotFoundError:
-                self.evaluations_X_ = self.sample_rewards()
-                self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
-            
-                with open('evaluations_X_.pkl', 'wb') as f:
-                    pkl.dump(self.evaluations_X_, f)
-                with open('hypervolume_X_.pkl', 'wb') as f:
-                    pkl.dump(self.hypervolume_X_, f)
-                    
-                print("Saved evaluations_X_ and hypervolume_X_ to files.")
+            self.evaluations_X_ = self.sample_rewards()
+            self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
 
     def training_state_dict(self) -> dict[str, Any]:
         state = super().training_state_dict()
