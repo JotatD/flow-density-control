@@ -9,16 +9,12 @@ from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import GEOMBaseModel
-from diffusiongym.molecules.rewards.utils import graph_to_mols
 from diffusiongym.rewards import DummyReward
-from rdkit import Chem
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
 from utils import seed_everything
 
-from genexp.mo.base import MOReward
 from genexp.mo.mo_mol import TopologyMetrics
-from genexp.mo.moses import diversity_metrics_2d, diversity_metrics_3d
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
     load_latest_training_checkpoint,
@@ -219,6 +215,9 @@ def main(config: Namespace) -> None:
     sa_t3 = log.watch("top_3/sa_t3", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
     
+    zero_valid_patience = 3
+    zero_valid_count = 0
+    
     # valid_2d = log.watch("diversity/validity_2d", "epoch")
     # valid_3d = log.watch("diversity/validity_3d", "epoch")
     # diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
@@ -310,6 +309,14 @@ def main(config: Namespace) -> None:
                 first_val_median.val = torch.median(first_val_eval).item()
                 first_val_mean.val = torch.mean(first_val_eval).item()
                 (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
+                
+                if valid_frac.val <= 0.0:
+                    zero_valid_count += 1
+                else:
+                    zero_valid_count = 0
+                    
+                if zero_valid_count >= zero_valid_patience:
+                    break
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
