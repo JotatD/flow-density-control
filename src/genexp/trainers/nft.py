@@ -1,3 +1,4 @@
+import tqdm
 
 import copy
 from argparse import Namespace
@@ -11,7 +12,6 @@ from diffusiongym.environments import Environment, Sample
 from diffusiongym.rewards import Reward
 from diffusiongym.types import D
 
-from genexp.trainers.utils import StepTimer
 
 
 class RewardStatTracker:
@@ -117,16 +117,16 @@ class DiffusionNFTrainer:
         self.fine_model = env.model
         self.exploration_model = copy.deepcopy(self.base_model)
         self.exploration_model.requires_grad_(False)
+        
+        self.off_policy = copy.deepcopy(self.base_model)
+        self.off_policy.requires_grad_(False)
+        
         self.reward_stat_tracker = RewardStatTracker(advantage_group_size=self.advantage_group_size)
         self.optimizer_steps = 0
         self.fulfill_max_attempts = config.fulfill_max_attempts
         self.exploration_decay_type = config.exploration_decay_type
 
         self.fulfill = config.fulfill_num_samples
-
-        self.timer = StepTimer(
-            device=self.device,
-        )
 
         self.configure_optimizers()
 
@@ -215,8 +215,7 @@ class DiffusionNFTrainer:
 
         self.optimizer.zero_grad()
         num_timesteps = len(idxs)
-        for idx in idxs:
-            print(idx)
+        for idx in tqdm.tqdm(idxs):
             t_batch = timesteps[idx].unsqueeze(0).expand(len(clean_latent))
             noise = clean_latent.randn_like().to(self.device)
             interpolant_alpha = self.base_model.scheduler.alpha(clean_latent, t_batch)
@@ -303,15 +302,18 @@ class DiffusionNFTrainer:
         return timed_final_stats
 
 
-    def update_exploration_model(self) -> None:
-        """Update the exploration policy from the fine policy using the configured EMA."""
+    def update_off_policy_model(self) -> None:
+        """I dont want to figure a more efficient way dawg."""
         decay = exploration_decay(self.optimizer_steps, self.exploration_decay_type)
         for fine_parameter, exploration_parameter in zip(
             self.fine_model.parameters(),
-            self.exploration_model.parameters(),
+            self.off_policy.parameters(),
             strict=True,
         ):
             exploration_parameter.lerp_(fine_parameter, 1.0 - decay)
+            
+    def update_exploration_model(self) -> None:
+        self.exploration_model.load_state_dict(self.off_policy.state_dict())
             
 def exploration_decay(step: int, decay_type: int) -> float:
     """Return the exploration-policy EMA decay used by DiffusionNFT."""

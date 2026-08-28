@@ -1,4 +1,5 @@
 import copy
+import pickle as pkl
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Any
@@ -60,8 +61,23 @@ class HVRL(DiffusionNFTrainer):
 
     def fix_optimization_problem(self):
         with torch.no_grad():
-            self.evaluations_X_ = self.sample_rewards()
-            self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
+            # check if the file exists otherwise create and save
+            try:
+                with open('evaluations_X_.pkl', 'rb') as f:
+                    self.evaluations_X_ = pkl.load(f).to('cpu')
+                with open('hypervolume_X_.pkl', 'rb') as f:
+                    self.hypervolume_X_ = pkl.load(f).to('cpu')
+                print("Loaded evaluations_X_ and hypervolume_X_ from files.")
+            except FileNotFoundError:
+                self.evaluations_X_ = self.sample_rewards()
+                self.hypervolume_X_ = self.hv_computer(self.evaluations_X_)
+            
+                with open('evaluations_X_.pkl', 'wb') as f:
+                    pkl.dump(self.evaluations_X_, f)
+                with open('hypervolume_X_.pkl', 'wb') as f:
+                    pkl.dump(self.hypervolume_X_, f)
+                    
+                print("Saved evaluations_X_ and hypervolume_X_ to files.")
 
     def training_state_dict(self) -> dict[str, Any]:
         state = super().training_state_dict()
@@ -78,6 +94,7 @@ class HVRL(DiffusionNFTrainer):
 
     def hv_first_variation(self, sample: D, latent: D) -> tuple[torch.Tensor, dict[str, Any]]:
         obj_x, info = self.reward(sample, latent)
+        info['obj'] = obj_x
         inp_batch = obj_x.shape[0]
         obj_x = obj_x.reshape(inp_batch, 1, 1, self.num_rews).expand(
             inp_batch,
@@ -85,6 +102,8 @@ class HVRL(DiffusionNFTrainer):
             1,
             self.num_rews,
         )
+        self.evaluations_X_ = self.evaluations_X_.to(obj_x.device)
+        self.hypervolume_X_ = self.hypervolume_X_.to(obj_x.device)
         expanded_obj_X_ = self.evaluations_X_.expand(inp_batch, self.num_p_nm1, self.n - 1, self.num_rews)
         complete_X = torch.cat([expanded_obj_X_, obj_x], dim=2)
         complete_hv = self.hv_computer(complete_X)
@@ -92,7 +111,6 @@ class HVRL(DiffusionNFTrainer):
         hv_improvement = complete_hv - expanded_hv_X_
         first_var = hv_improvement.mean(dim=1)
 
-        info['obj'] = obj_x
         info['scalarization'] = first_var
         return first_var, info
     
