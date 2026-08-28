@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from diffusiongym import DDMixin, Scheduler
+from diffusiongym import DDMixin
 from diffusiongym.base_models import BaseModel
 from diffusiongym.environments import Environment, Sample
 from diffusiongym.rewards import Reward
@@ -55,31 +55,6 @@ def subsample_steps(total_steps, percentage):
     samples = np.random.choice(np.arange(total_steps), size=steps_count, replace=False)
     return np.sort(samples)
 
-
-def endpoint(model: BaseModel[D], vt: D, xt: D, t: torch.Tensor) -> D:
-    """Recover the clean endpoint from an interpolant state and velocity."""
-    scheduler: Scheduler = model.scheduler
-    beta = scheduler.beta(xt, t)
-    beta_dot = scheduler.beta_dot(xt, t)
-    alpha = scheduler.alpha(xt, t)
-    alpha_dot = scheduler.alpha_dot(xt, t)
-    return (beta * vt - beta_dot * xt) / (alpha_dot * beta - alpha * beta_dot)
-
-
-def velocity(model: BaseModel[D], x: D, t: torch.Tensor, **kwargs) -> D:
-    """Convert an endpoint prediction to the corresponding interpolant velocity."""
-    output = model.forward(x, t, **kwargs)
-    scheduler: Scheduler = model.scheduler
-
-    if model.output_type == "endpoint":
-        alpha = scheduler.alpha(x, t)
-        beta = scheduler.beta(x, t)
-        beta_dot = scheduler.beta_dot(x, t)
-        alpha_dot = scheduler.alpha_dot(x, t)
-
-        return (beta_dot / beta) * x + (alpha_dot - alpha * beta_dot / beta) * output
-
-    raise ValueError(f"{model.output_type} not supported")
 
 class DiffusionNFTrainer:
     def __init__(
@@ -225,14 +200,14 @@ class DiffusionNFTrainer:
 
             step_kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
 
-            forward_prediction = velocity(self.fine_model, xt, t_batch, **step_kwargs)
+            forward_endpoint = self.fine_model.forward(xt, t_batch, **step_kwargs)
 
             with torch.no_grad():
-                old_prediction = velocity(self.exploration_model, xt, t_batch, **step_kwargs)
-                ref_forward_prediction = velocity(self.base_model, xt, t_batch, **step_kwargs)
+                old_endpoint = self.exploration_model.forward(xt, t_batch, **step_kwargs)
+                ref_endpoint = self.base_model.forward(xt, t_batch, **step_kwargs)
 
-            positive_v = self.mixing_beta * forward_prediction + (1 - self.mixing_beta) * old_prediction
-            positive_endpoint = endpoint(self.base_model, positive_v, xt, t_batch)
+            # The NFT coefficients sum to one, so endpoint mixing is equivalent to mixing velocities and converting back.
+            positive_endpoint = self.mixing_beta * forward_endpoint + (1 - self.mixing_beta) * old_endpoint
 
             with torch.no_grad():
                 positive_weight_factor = (
@@ -241,8 +216,7 @@ class DiffusionNFTrainer:
 
             positive_loss = ((positive_endpoint - clean_latent) ** 2).aggregate("mean") / positive_weight_factor
 
-            negative_v = -self.mixing_beta * forward_prediction + (1 + self.mixing_beta) * old_prediction
-            negative_endpoint = endpoint(self.base_model, negative_v, xt, t_batch)
+            negative_endpoint = -self.mixing_beta * forward_endpoint + (1 + self.mixing_beta) * old_endpoint
             with torch.no_grad():
                 negative_weight_factor = (
                     (negative_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
@@ -253,23 +227,23 @@ class DiffusionNFTrainer:
             ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (negative_loss / self.mixing_beta)
             policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
 
-            kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean()
+            kl_div_loss = ((forward_endpoint - ref_endpoint) ** 2).aggregate("mean").mean()
             loss = policy_loss + self.kl_weight * kl_div_loss
 
             timed_statistics["policy_loss"].append(policy_loss.item())
             timed_statistics["unweighted_policy_loss"].append(ori_policy_loss.mean().item())
             timed_statistics["kl_div_loss"].append(kl_div_loss.item())
             timed_statistics["old_kl_div"].append(
-                ((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean().item()
+                ((old_endpoint - ref_endpoint) ** 2).aggregate("mean").mean().item()
             )
             timed_statistics["total_loss"].append(loss.item())
             timed_statistics["x0_norm"].append((clean_latent**2).aggregate("mean").mean().item())
             timed_statistics["x0_norm_max"].append((clean_latent**2).aggregate("max").mean().item())
             timed_statistics["old_deviate"].append(
-                ((old_prediction - forward_prediction) ** 2).aggregate("mean").mean().item()
+                ((old_endpoint - forward_endpoint) ** 2).aggregate("mean").mean().item()
             )
             timed_statistics["old_deviate_max"].append(
-                ((old_prediction - forward_prediction) ** 2).aggregate("max").mean().item()
+                ((old_endpoint - forward_endpoint) ** 2).aggregate("max").mean().item()
             )
 
             if loss.isnan():
