@@ -61,18 +61,19 @@ def parse_args() -> argparse.Namespace:
     #every n step
     parser.add_argument("--update_pretrained_every_n_steps", type=int, default=1000)
     parser.add_argument("--sample_nm1_every_n_steps", type=int, default=1000)
-    parser.add_argument("--resample_every_n_steps", type=int, default=10)
+    parser.add_argument("--resample_every_n_steps", type=int, default=1)
     
     parser.add_argument("--save_every_n_steps", type=int, default=10)
     
     #size
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_samples", type=int, default=64)
-    parser.add_argument("--advantage_group_size", type=int, default=64)
+    parser.add_argument("--backward_batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=320)
+    parser.add_argument("--num_samples", type=int, default=32)
+    parser.add_argument("--advantage_group_size", type=int, default=32)
     parser.add_argument("--num_p_nm1", type=int, default=60)
     parser.add_argument("--vol_samples", type=int, default=64)
     parser.add_argument("--num_diversity_samples", type=int, default=128)
-    parser.add_argument("--timestep_fraction", type=float, default=0.50)
+    parser.add_argument("--timestep_fraction", type=float, default=1.0)
 
     parser.add_argument("--fulfill_num_samples", type=str2bool, default="n")
     parser.add_argument("--only_valids", type=str2bool, default="n")
@@ -288,7 +289,6 @@ def main(config: Namespace) -> None:
         with timer.section("finetune"):
             timed_stats = trainer.finetune(dataset, advantages)
             
-        print(f"Epoch {epoch.val} completed")
         
         fulltime_stats = {f"full/{k}": np.mean(v) for k, v in timed_stats.items()}
         log.log_dict(fulltime_stats, 'epoch')
@@ -310,6 +310,7 @@ def main(config: Namespace) -> None:
             print(f"{name:30s}  n={cnt:5d}  total={total:8.3f}s  mean={mean*1e3:7.2f}ms  "
                 f"p50={p50*1e3:7.2f}ms  p95={p95*1e3:7.2f}ms")
 
+        print(f"Epoch {epoch.val} completed")
 
     log.finish()
     mark_run_complete(run_resolution.run_dir)

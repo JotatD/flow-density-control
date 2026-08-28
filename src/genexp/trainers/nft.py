@@ -97,6 +97,7 @@ class DiffusionNFTrainer:
         self.only_valids = config.only_valids
 
         self.batch_size: int = config.batch_size
+        self.backward_batch_size: int = config.backward_batch_size
 
         self.use_valids = use_valids
         self.adv_clip_max: float = config.adv_clip_max
@@ -290,10 +291,10 @@ class DiffusionNFTrainer:
         stats_avgs_per_batch = []
         start = 0
         while start < len(samples):
-            advs = advantages[start : start + self.batch_size]
-            batch_samples = Sample.concat(samples[start : start + self.batch_size])
+            advs = advantages[start : start + self.backward_batch_size]
+            batch_samples = Sample.concat(samples[start : start + self.backward_batch_size])
             stats_avgs_per_batch.append(self.train_step(batch_samples, advs))
-            start += self.batch_size
+            start += self.backward_batch_size
 
         timed_final_stats = stats_avgs_per_batch[0]
         for key in timed_final_stats:

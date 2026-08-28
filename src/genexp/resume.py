@@ -15,7 +15,17 @@ import torch
 
 MANIFEST_NAME = "run_manifest.json"
 CHECKPOINT_PREFIX = "training_state_epoch_"
-CONFIG_EXCLUSIONS = {"epochs", "force_new_start", "evaluate_diversity_every_n_steps", "evaluate_every_n_steps", "batch_size", "timestep_fraction"}
+CONFIG_EXCLUSIONS = {
+    "epochs",
+    "force_new_start",
+    "evaluate_diversity_every_n_steps",
+    "evaluate_every_n_steps",
+    "batch_size",
+    # "timestep_fraction",
+    "wandb",
+    # "num_integration_steps",
+    "backward_batch_size",
+}
 
 
 @dataclass(frozen=True)
@@ -27,11 +37,7 @@ class RunResolution:
 
 
 def _configuration(config) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in vars(config).items()
-        if key not in CONFIG_EXCLUSIONS
-    }
+    return {key: value for key, value in vars(config).items() if key not in CONFIG_EXCLUSIONS}
 
 
 def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
@@ -69,10 +75,7 @@ def resolve_run(config, results_root: Path, run_prefix: str) -> RunResolution:
 
         if matches:
             _, manifest_path, manifest = max(matches, key=lambda item: item[0])
-            completed = (
-                manifest.get("status") == "complete"
-                and manifest.get("epochs", 0) >= config.epochs
-            )
+            completed = manifest.get("status") == "complete" and manifest.get("epochs", 0) >= config.epochs
             if not completed:
                 manifest["epochs"] = config.epochs
                 manifest["status"] = "running"
@@ -128,17 +131,13 @@ def _checkpoint_paths(run_dir: Path) -> list[Path]:
     )
 
 
-def load_latest_training_checkpoint(
-    run_dir: Path, map_location: str | torch.device
-) -> dict[str, Any] | None:
+def load_latest_training_checkpoint(run_dir: Path, map_location: str | torch.device) -> dict[str, Any] | None:
     paths = _checkpoint_paths(run_dir)
     failures = []
     for path in paths:
         try:
             try:
-                checkpoint = torch.load(
-                    path, map_location=map_location, weights_only=False
-                )
+                checkpoint = torch.load(path, map_location=map_location, weights_only=False)
             except TypeError:
                 checkpoint = torch.load(path, map_location=map_location)
             if not isinstance(checkpoint, dict) or "next_epoch" not in checkpoint:
