@@ -6,9 +6,10 @@ from typing import Any
 
 import numpy as np
 import torch
-from diffusiongym import DDMixin
-from diffusiongym.base_models import BaseModel
+import torch.nn.functional as F
 from diffusiongym.environments import Environment, Sample
+from diffusiongym.molecules import DDGraph
+from diffusiongym.molecules.flowmol import FlowMolBaseModel
 from diffusiongym.rewards import Reward
 from diffusiongym.types import D
 
@@ -56,12 +57,70 @@ def subsample_steps(total_steps, percentage):
     return np.sort(samples)
 
 
+def _mean_per_graph(values: torch.Tensor, batch_idxs: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Average one scalar per node or edge independently for each graph."""
+    totals = values.new_zeros(batch_size)
+    counts = values.new_zeros(batch_size)
+    totals.index_add_(0, batch_idxs, values)
+    counts.index_add_(0, batch_idxs, torch.ones_like(values))
+    return totals / counts.clamp(min=1)
+
+
+def flowmol_reference_loss(prediction: DDGraph, reference: DDGraph, weights: dict[str, float]) -> torch.Tensor:
+    """Compute per-molecule coordinate MSE and categorical KL to a reference endpoint."""
+    pred_graph = prediction.graph
+    ref_graph = reference.graph
+    batch_size = len(prediction)
+
+    losses = {
+        "x": _mean_per_graph(
+            ((pred_graph.ndata["x_t"] - ref_graph.ndata["x_t"]) ** 2).mean(dim=-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+        "a": _mean_per_graph(
+            F.kl_div(
+                F.log_softmax(pred_graph.ndata["a_t"], dim=-1),
+                F.softmax(ref_graph.ndata["a_t"], dim=-1),
+                reduction="none",
+            ).sum(dim=-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+        "c": _mean_per_graph(
+            F.kl_div(
+                F.log_softmax(pred_graph.ndata["c_t"], dim=-1),
+                F.softmax(ref_graph.ndata["c_t"], dim=-1),
+                reduction="none",
+            ).sum(dim=-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+    }
+
+    upper_edge_mask = prediction.ue_mask
+    losses["e"] = _mean_per_graph(
+        F.kl_div(
+            F.log_softmax(pred_graph.edata["e_t"][upper_edge_mask], dim=-1),
+            F.softmax(ref_graph.edata["e_t"][upper_edge_mask], dim=-1),
+            reduction="none",
+        ).sum(dim=-1),
+        prediction.e_idx[upper_edge_mask],
+        batch_size,
+    )
+
+    total = pred_graph.ndata["x_t"].new_zeros(batch_size)
+    for field, field_loss in losses.items():
+        total = total + weights[field] * field_loss
+    return total
+
+
 class DiffusionNFTrainer:
     def __init__(
         self,
         config: Namespace,
         env: Environment,
-        base_model: BaseModel,
+        base_model: FlowMolBaseModel,
         device: torch.device | None = None,
         use_valids: bool = False,
     ):
@@ -166,7 +225,7 @@ class DiffusionNFTrainer:
         return all_samples, advantages, all_rewards
 
     def train_step(self, sample: Sample, advantages: torch.Tensor) -> dict[str, list[float]]:
-        clean_latent: DDMixin = sample.latent.to(self.device)
+        clean_latent: DDGraph = sample.latent.to(self.device)
         timesteps = sample.timesteps.to(self.device)
         kwargs = sample.kwargs
         timed_statistics = {
@@ -191,6 +250,7 @@ class DiffusionNFTrainer:
 
         self.optimizer.zero_grad()
         num_timesteps = len(idxs)
+        loss_weights = self.base_model.model.total_loss_weights
         for idx in tqdm.tqdm(idxs):
             t_batch = timesteps[idx].unsqueeze(0).expand(len(clean_latent))
             noise = clean_latent.randn_like().to(self.device)
@@ -199,52 +259,38 @@ class DiffusionNFTrainer:
             xt = interpolant_alpha * clean_latent + interpolant_beta * noise
 
             step_kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+            prediction_kwargs = {**step_kwargs, "apply_softmax": False, "remove_com": False}
 
-            forward_endpoint = self.fine_model.forward(xt, t_batch, **step_kwargs)
+            forward_endpoint = self.fine_model.forward(xt, t_batch, **prediction_kwargs)
 
             with torch.no_grad():
-                old_endpoint = self.exploration_model.forward(xt, t_batch, **step_kwargs)
-                ref_endpoint = self.base_model.forward(xt, t_batch, **step_kwargs)
+                old_endpoint = self.exploration_model.forward(xt, t_batch, **prediction_kwargs)
+                ref_endpoint = self.base_model.forward(xt, t_batch, **prediction_kwargs)
 
-            # The NFT coefficients sum to one, so endpoint mixing is equivalent to mixing velocities and converting back.
             positive_endpoint = self.mixing_beta * forward_endpoint + (1 - self.mixing_beta) * old_endpoint
-
-            with torch.no_grad():
-                positive_weight_factor = (
-                    (positive_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
-                )
-
-            positive_loss = ((positive_endpoint - clean_latent) ** 2).aggregate("mean") / positive_weight_factor
+            positive_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=positive_endpoint)
 
             negative_endpoint = -self.mixing_beta * forward_endpoint + (1 + self.mixing_beta) * old_endpoint
-            with torch.no_grad():
-                negative_weight_factor = (
-                    (negative_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
-                )
-
-            negative_loss = ((negative_endpoint - clean_latent) ** 2).aggregate("mean") / negative_weight_factor
+            negative_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=negative_endpoint)
 
             ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (negative_loss / self.mixing_beta)
             policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
 
-            kl_div_loss = ((forward_endpoint - ref_endpoint) ** 2).aggregate("mean").mean()
+            kl_div_loss = flowmol_reference_loss(forward_endpoint, ref_endpoint, loss_weights).mean()
+            old_deviate = flowmol_reference_loss(forward_endpoint, old_endpoint, loss_weights)
             loss = policy_loss + self.kl_weight * kl_div_loss
 
             timed_statistics["policy_loss"].append(policy_loss.item())
             timed_statistics["unweighted_policy_loss"].append(ori_policy_loss.mean().item())
             timed_statistics["kl_div_loss"].append(kl_div_loss.item())
             timed_statistics["old_kl_div"].append(
-                ((old_endpoint - ref_endpoint) ** 2).aggregate("mean").mean().item()
+                flowmol_reference_loss(old_endpoint, ref_endpoint, loss_weights).mean().item()
             )
             timed_statistics["total_loss"].append(loss.item())
             timed_statistics["x0_norm"].append((clean_latent**2).aggregate("mean").mean().item())
             timed_statistics["x0_norm_max"].append((clean_latent**2).aggregate("max").mean().item())
-            timed_statistics["old_deviate"].append(
-                ((old_endpoint - forward_endpoint) ** 2).aggregate("mean").mean().item()
-            )
-            timed_statistics["old_deviate_max"].append(
-                ((old_endpoint - forward_endpoint) ** 2).aggregate("max").mean().item()
-            )
+            timed_statistics["old_deviate"].append(old_deviate.mean().item())
+            timed_statistics["old_deviate_max"].append(old_deviate.max().item())
 
             if loss.isnan():
                 self.optimizer.zero_grad()
