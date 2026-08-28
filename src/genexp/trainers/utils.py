@@ -44,6 +44,7 @@ class StepTimer:
 
     @contextmanager
     def section(self, name):
+        print(f"Starting section: {name}")
         if self._use_cuda_sync:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -53,8 +54,8 @@ class StepTimer:
             if self._use_cuda_sync:
                 torch.cuda.synchronize()
             dt = time.perf_counter() - t0
-            print("Name inserted: ", name, "Time taken: ", dt)
             self.times[name].append(dt)
+            print(f"Section {name} took {dt:.4f} seconds")
 
     def summary(self, top_k=None):
         # returns (name, count, total, mean, p50, p95)

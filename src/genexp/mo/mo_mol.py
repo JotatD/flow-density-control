@@ -115,7 +115,7 @@ class TopologyMetrics(MOReward[DDGraph]):
                     valid_mols.append(relaxed_mol)
                     valid_indices.append(i)
 
-        rewards = torch.zeros((len(sample), 2), device=sample.device, dtype=torch.float32)
+        rewards = torch.zeros((len(sample), self.num_rew), device=sample.device, dtype=torch.float32)
         valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
 
         if not valid_mols:
@@ -128,6 +128,75 @@ class TopologyMetrics(MOReward[DDGraph]):
             mol = mols[idx]
             rewards[idx, 0] = float(self.calculate_qed(mol))
             rewards[idx, 1] = float(self.calculate_sa(mol))
+            valids[idx] = True
+
+        return rewards, {"valids": valids}
+
+
+class RDkitReward(MOReward[DDGraph]):
+    def __init__(self, rewards: list[str], valid_2d: str = "none", valid_3d: str = "none") -> None:
+        RDLogger.DisableLog("rdApp.*")
+        
+        if valid_3d != "none":
+            full_bust = "mol" if (valid_3d == "full") else "mol_fast"
+            self.buster = PoseBusters(config=full_bust, max_workers=None)
+        else:
+            self.buster = None
+            
+        self.validate_2d: bool = (valid_2d == "full")
+        
+        self.rewards = rewards
+        self.num_rew = len(rewards)
+        self.ref_point = torch.zeros(self.num_rew, dtype=torch.float32)
+
+    @staticmethod
+    def calculate_qed(rdmol):
+        return QED.qed(rdmol)
+
+    @staticmethod
+    def calculate_sa(rdmol):
+        sa = calculateScore(rdmol)
+        sa_n = (10 - sa) / 9
+        return sa_n
+    
+    def evaluate_reward(self, mol: Chem.Mol) -> torch.Tensor:
+        reward_values = []
+        for reward_name in self.rewards:
+            if reward_name == "qed":
+                reward_values.append(self.calculate_qed(mol))
+            elif reward_name == "sa":
+                reward_values.append(self.calculate_sa(mol))
+            else:
+                raise ValueError(f"Unknown reward: {reward_name}")
+        return torch.tensor(reward_values, dtype=torch.float32)
+
+    def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        mols = graph_to_mols(sample)
+
+        valid_mols: list[Chem.Mol] = []
+        valid_indices: list[int] = []
+        
+        for i, mol in enumerate(mols):
+            if not self.validate_2d or (is_valid(mol) and is_not_fragmented(mol)):
+                valid_mols.append(mol)
+                valid_indices.append(i)
+
+        rewards = torch.zeros((len(sample), self.num_rew), device=sample.device, dtype=torch.float32)
+        valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
+
+        if not valid_mols:
+            return rewards, {"valids": valids}
+
+        if self.buster is not None:
+            posebuster_valids = self.buster.bust(valid_mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
+        else:
+            posebuster_valids = [True] * len(valid_mols)
+            
+        valid_indices = [idx for idx, is_valid in zip(valid_indices, posebuster_valids) if is_valid]
+
+        for idx in valid_indices:
+            mol = mols[idx]
+            rewards[idx] = self.evaluate_reward(mol)
             valids[idx] = True
 
         return rewards, {"valids": valids}
