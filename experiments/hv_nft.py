@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate_2d", type=str, default="none", choices=["none", "full"])
     parser.add_argument("--validate_3d", type=str, default="none", choices=["none", "fast", "full"])
     parser.add_argument("--exploration_decay_type", type=int, choices=[0, 1, 2], default=1)
+    
+    parser.add_argument("--only_10A", type=str2bool, default="n")
 
     #logging
     parser.add_argument("--num-time-groups", type=int, default=2)    
@@ -181,6 +183,10 @@ def main(config: Namespace) -> None:
         reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d)
         model = GEOMBaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
+        if config.only_10A:
+            unconstrained_sample = env.sample
+            env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
+
 
         hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
         trainer = HVRL(config, env, reward, hv_computer=hv_computer, device=device)
