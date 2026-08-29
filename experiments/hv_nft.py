@@ -85,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exploration_decay_type", type=int, choices=[0, 1, 2], default=1)
     
     parser.add_argument("--only_10A", type=str2bool, default="n")
+    parser.add_argument("--invalid_val", type=float, default=0.0)
 
     #logging
     parser.add_argument("--num-time-groups", type=int, default=2)    
@@ -176,7 +177,7 @@ def main(config: Namespace) -> None:
         print("problem=dxtb_10A")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d)
+        reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
         model = GEOMBaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.only_10A:

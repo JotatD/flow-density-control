@@ -13,7 +13,7 @@ from genexp.mo.sa_score import calculateScore
 
 
 class TopologyMetrics(MOReward[DDGraph]):
-    def __init__(self, valid_2d: str = "none", valid_3d: str = "none") -> None:
+    def __init__(self, valid_2d: str = "none", valid_3d: str = "none", invalid_val: float = 0.0) -> None:
         RDLogger.DisableLog("rdApp.*")
 
         if valid_3d != "none":
@@ -23,9 +23,13 @@ class TopologyMetrics(MOReward[DDGraph]):
             self.buster = None
 
         self.validate_2d: bool = valid_2d == "full"
+        self.invalid_val = invalid_val
+        
+        if self.invalid_val > 0:
+            raise ValueError("invalid_val must be <= 0 for TopologyMetrics")
 
         self.num_rew = 2
-        self.ref_point = torch.zeros(self.num_rew, dtype=torch.float32)
+        self.ref_point = torch.full((self.num_rew,), fill_value=self.invalid_val, dtype=torch.float32)
 
     @staticmethod
     def calculate_qed(rdmol):
@@ -48,7 +52,7 @@ class TopologyMetrics(MOReward[DDGraph]):
                 valid_mols.append(mol)
                 valid_indices.append(i)
 
-        rewards = torch.zeros((len(sample), self.num_rew), device=sample.device, dtype=torch.float32)
+        rewards = torch.full((len(sample), self.num_rew), fill_value=self.invalid_val, device=sample.device, dtype=torch.float32)
         valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
 
         if not valid_mols:
@@ -71,7 +75,7 @@ class TopologyMetrics(MOReward[DDGraph]):
 
 
 class RDkitReward(MOReward[DDGraph]):
-    def __init__(self, rewards: list[str], valid_2d: str = "none", valid_3d: str = "none") -> None:
+    def __init__(self, rewards: list[str], valid_2d: str = "none", valid_3d: str = "none", invalid_val: float = 0.0) -> None:
         RDLogger.DisableLog("rdApp.*")
         
         if valid_3d != "none":
@@ -81,10 +85,13 @@ class RDkitReward(MOReward[DDGraph]):
             self.buster = None
             
         self.validate_2d: bool = (valid_2d == "full")
-        
+        if invalid_val > 0:
+            raise ValueError("invalid_val must be <= 0 for RDkitReward")
+
         self.rewards = rewards
         self.num_rew = len(rewards)
-        self.ref_point = torch.zeros(self.num_rew, dtype=torch.float32)
+        self.invalid_val = invalid_val
+        self.ref_point = torch.full((self.num_rew,), fill_value=self.invalid_val, dtype=torch.float32)
 
     @staticmethod
     def calculate_qed(rdmol):
@@ -118,7 +125,7 @@ class RDkitReward(MOReward[DDGraph]):
                 valid_mols.append(mol)
                 valid_indices.append(i)
 
-        rewards = torch.zeros((len(sample), self.num_rew), device=sample.device, dtype=torch.float32)
+        rewards = torch.full((len(sample), self.num_rew), fill_value=self.invalid_val, device=sample.device, dtype=torch.float32)
         valids = torch.zeros(len(sample), device=sample.device, dtype=torch.bool)
 
         if not valid_mols:
