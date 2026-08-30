@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--adv_clip_max", type=float, default=5.0)
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
+    parser.add_argument("--adaptive_loss_scaling", type=str2bool, default="y")
+    parser.add_argument("--adaptive_scale_eps", type=float, default=1e-5)
     parser.add_argument("--num_inner_epochs", type=int, default=1) # currently unused
     parser.add_argument("--num_integration_steps", type=int, default=100)
 

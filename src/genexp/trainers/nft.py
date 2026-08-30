@@ -66,6 +66,60 @@ def _mean_per_graph(values: torch.Tensor, batch_idxs: torch.Tensor, batch_size: 
     return totals / counts.clamp(min=1)
 
 
+@torch.no_grad()
+def flowmol_adaptive_error_scale(
+    prediction: DDGraph,
+    target: DDGraph,
+    weights: dict[str, float],
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Compute a detached per-molecule error scale for mixed FlowMol endpoints."""
+    pred_graph = prediction.graph
+    target_graph = target.graph
+    batch_size = len(prediction)
+
+    errors = {
+        "x": _mean_per_graph(
+            (pred_graph.ndata["x_t"] - target_graph.ndata["x_t"]).abs().mean(dim=-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+        "a": _mean_per_graph(
+            1.0
+            - F.softmax(pred_graph.ndata["a_t"], dim=-1)
+            .gather(-1, target_graph.ndata["a_t"].argmax(dim=-1, keepdim=True))
+            .squeeze(-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+        "c": _mean_per_graph(
+            1.0
+            - F.softmax(pred_graph.ndata["c_t"], dim=-1)
+            .gather(-1, target_graph.ndata["c_t"].argmax(dim=-1, keepdim=True))
+            .squeeze(-1),
+            prediction.n_idx,
+            batch_size,
+        ),
+    }
+
+    upper_edge_mask = prediction.ue_mask
+    errors["e"] = _mean_per_graph(
+        1.0
+        - F.softmax(pred_graph.edata["e_t"][upper_edge_mask], dim=-1)
+        .gather(-1, target_graph.edata["e_t"][upper_edge_mask].argmax(dim=-1, keepdim=True))
+        .squeeze(-1),
+        prediction.e_idx[upper_edge_mask],
+        batch_size,
+    )
+
+    total = pred_graph.ndata["x_t"].new_zeros(batch_size)
+    total_weight = 0.0
+    for field, field_error in errors.items():
+        total = total + weights[field] * field_error
+        total_weight += weights[field]
+    return (total / total_weight).detach().clamp(min=eps)
+
+
 def flowmol_reference_loss(prediction: DDGraph, reference: DDGraph, weights: dict[str, float]) -> torch.Tensor:
     """Compute per-molecule coordinate MSE and categorical KL to a reference endpoint."""
     pred_graph = prediction.graph
@@ -143,6 +197,8 @@ class DiffusionNFTrainer:
 
         self.mixing_beta: float = config.beta
         self.kl_weight: float = config.alpha
+        self.adaptive_loss_scaling: bool = getattr(config, "adaptive_loss_scaling", True)
+        self.adaptive_scale_eps: float = getattr(config, "adaptive_scale_eps", 1e-5)
         # self.exploration_decay_type: int = config.exploration_decay_type
 
         self.env = env
@@ -230,7 +286,10 @@ class DiffusionNFTrainer:
         kwargs = sample.kwargs
         timed_statistics = {
             "policy_loss": [],
+            "raw_policy_loss": [],
             "unweighted_policy_loss": [],
+            "positive_error_scale": [],
+            "negative_error_scale": [],
             "kl_div_loss": [],
             "old_kl_div": [],
             "total_loss": [],
@@ -268,11 +327,26 @@ class DiffusionNFTrainer:
                 ref_endpoint = self.base_model.forward(xt, t_batch, **prediction_kwargs)
 
             positive_endpoint = self.mixing_beta * forward_endpoint + (1 - self.mixing_beta) * old_endpoint
-            positive_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=positive_endpoint)
+            raw_positive_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=positive_endpoint)
 
             negative_endpoint = -self.mixing_beta * forward_endpoint + (1 + self.mixing_beta) * old_endpoint
-            negative_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=negative_endpoint)
+            raw_negative_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=negative_endpoint)
 
+            positive_error_scale = torch.ones_like(raw_positive_loss)
+            negative_error_scale = torch.ones_like(raw_negative_loss)
+            if self.adaptive_loss_scaling:
+                positive_error_scale = flowmol_adaptive_error_scale(
+                    positive_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                )
+                negative_error_scale = flowmol_adaptive_error_scale(
+                    negative_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                )
+            positive_loss = raw_positive_loss / positive_error_scale
+            negative_loss = raw_negative_loss / negative_error_scale
+
+            raw_ori_policy_loss = r * (raw_positive_loss / self.mixing_beta) + (1.0 - r) * (
+                raw_negative_loss / self.mixing_beta
+            )
             ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (negative_loss / self.mixing_beta)
             policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
 
@@ -281,7 +355,10 @@ class DiffusionNFTrainer:
             loss = policy_loss + self.kl_weight * kl_div_loss
 
             timed_statistics["policy_loss"].append(policy_loss.item())
+            timed_statistics["raw_policy_loss"].append((raw_ori_policy_loss * self.adv_clip_max).mean().item())
             timed_statistics["unweighted_policy_loss"].append(ori_policy_loss.mean().item())
+            timed_statistics["positive_error_scale"].append(positive_error_scale.mean().item())
+            timed_statistics["negative_error_scale"].append(negative_error_scale.mean().item())
             timed_statistics["kl_div_loss"].append(kl_div_loss.item())
             timed_statistics["old_kl_div"].append(
                 flowmol_reference_loss(old_endpoint, ref_endpoint, loss_weights).mean().item()
