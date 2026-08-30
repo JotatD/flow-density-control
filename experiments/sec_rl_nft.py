@@ -85,13 +85,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exploration_decay_type", type=int, choices=[0, 1, 2], default=1)
     
     parser.add_argument("--fixed_A", type=int, default=10) # if 0, the atoms are selcted at random
-    parser.add_argument("--invalid_val", type=float, default=0.0)
+    parser.add_argument("--invalid_val", type=float, default=-1.0)
 
     #logging
     parser.add_argument("--num-time-groups", type=int, default=2)    
     
     return parser.parse_args()
-
+    
 def sample_x(num_samples: int, trainer: DiffusionNFTrainer, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
     left = num_samples
     samples: list[Sample] = []
