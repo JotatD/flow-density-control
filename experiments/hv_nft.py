@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate_3d", type=str, default="none", choices=["none", "fast", "full"])
     parser.add_argument("--exploration_decay_type", type=int, choices=[0, 1, 2], default=1)
     
-    parser.add_argument("--only_10A", type=str2bool, default="n")
+    parser.add_argument("--fixed_A", type=int, default=10) # if 0, the atoms are selcted at random
     parser.add_argument("--invalid_val", type=float, default=0.0)
 
     #logging
@@ -182,9 +182,9 @@ def main(config: Namespace) -> None:
         reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
         model = GEOMBaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
-        if config.only_10A:
+        if config.fixed_A > 0:
             unconstrained_sample = env.sample
-            env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=10, **kwargs)  # ty: ignore[invalid-assignment]
+            env.sample = lambda *args, **kwargs: unconstrained_sample(*args, n_atoms=config.fixed_A, **kwargs)  # ty: ignore[invalid-assignment]
 
 
         hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
