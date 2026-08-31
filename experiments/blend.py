@@ -6,11 +6,16 @@ from math import ceil
 from pathlib import Path
 
 import torch
+from diffusiongym import Sample
+from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import GEOMBaseModel
+from diffusiongym.molecules.rewards.utils import graph_to_mols
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.mo_mol import TopologyMetrics
+from genexp.mo.moses import diversity_metrics_2d
+# from genexp.mo.moses import diversity_metrics_3d
 from genexp.mo.utils import HVComputer
 from genexp.resume import mark_run_complete, resolve_run
 from genexp.trainers.diff_blend import BlendEnvironment
@@ -24,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     # logging
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--force_new_start", action="store_true")
-    parser.add_argument("--project_name", type=str, default="blend")
+    parser.add_argument("--project_name", type=str, default="blend_2")
     parser.add_argument("--run_name", type=str, default="diffusion_blend")
     parser.add_argument("--seed", type=int, default=5)
 
@@ -40,8 +45,9 @@ def parse_args() -> argparse.Namespace:
     # evaluation size
     parser.add_argument("--n", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=320)
-    parser.add_argument("--vol_samples", type=int, default=64)
+    parser.add_argument("--vol_samples", type=int, default=320)
     parser.add_argument("--samples_per_tradeoff", type=int, default=8)
+    parser.add_argument("--num_diversity_samples", type=int, default=1000)
 
     # validity
     parser.add_argument("--validate_2d", type=str, default="none", choices=["none", "full"])
@@ -151,6 +157,30 @@ def sample_rewards(
     return results
 
 
+def sample_x(
+    env: BlendEnvironment,
+    tradeoffs: list[list[float]],
+    samples_per_tradeoff: int,
+    num_samples: int,
+    discretization_steps: int,
+    batch_size: int,
+    fixed_atoms: int,
+) -> list[Sample[DDGraph]]:
+    samples = []
+    sample_kwargs = {"n_atoms": fixed_atoms} if fixed_atoms > 0 else {}
+    with torch.no_grad():
+        for blend_vector in tradeoffs:
+            left = min(samples_per_tradeoff, num_samples - len(samples))
+            while left > 0:
+                batch = min(left, batch_size)
+                sampled = env.sample(batch, blend_vector=blend_vector, discretization_steps=discretization_steps, pbar=True, **sample_kwargs)
+                samples.extend([sample for sample in sampled])
+                left -= batch
+            if len(samples) == num_samples:
+                break
+    return samples
+
+
 def compute_hypervolume(rewards: torch.Tensor, hv_computer: HVComputer) -> float:
     if rewards.shape[0] == 0:
         return 0.0
@@ -173,53 +203,29 @@ def evaluate_reward_results(
     hv_computer: HVComputer,
     group_size: int,
     shuffle_seed: int,
-) -> dict[str, float]:
+) -> tuple[float, float, torch.Tensor, float]:
     rewards = torch.cat([preference_rewards for preference_rewards, _ in results], dim=0)
     valids = torch.cat([preference_valids for _, preference_valids in results], dim=0)
     valid_rewards = rewards[valids]
-    means, top_decile_means, top_3_means = summarize_rewards(valid_rewards)
-    metrics = {
-        "blend/full_hypervolume": compute_hypervolume(valid_rewards, hv_computer),
-        "blend/qed": means[0],
-        "blend/sa": means[1],
-        "blend/top_decile/qed": top_decile_means[0],
-        "blend/top_decile/sa": top_decile_means[1],
-        "blend/top_3/qed": top_3_means[0],
-        "blend/top_3/sa": top_3_means[1],
-        "blend/valid_fraction": valids.float().mean().item(),
-    }
+    full_hypervolume = compute_hypervolume(valid_rewards, hv_computer)
 
     generator = torch.Generator(device="cpu").manual_seed(shuffle_seed)
     shuffled_rewards = valid_rewards[torch.randperm(valid_rewards.shape[0], generator=generator)]
     grouped_count = shuffled_rewards.shape[0] - shuffled_rewards.shape[0] % group_size
     if grouped_count > 0:
         grouped_rewards = shuffled_rewards[:grouped_count].reshape(-1, group_size, rewards.shape[1])
-        metrics["blend/n_hypervolume"] = hv_computer(grouped_rewards).mean().item()
+        n_hypervolume = hv_computer(grouped_rewards).mean().item()
     else:
-        metrics["blend/n_hypervolume"] = 0.0
+        n_hypervolume = 0.0
 
-    for index, (preference_rewards, preference_valids) in enumerate(results):
-        valid_preference_rewards = preference_rewards[preference_valids]
-        prefix = f"blend/preference_{index:02d}"
-        metrics[f"{prefix}/valid_fraction"] = preference_valids.float().mean().item()
-        metrics[f"{prefix}/hypervolume"] = compute_hypervolume(valid_preference_rewards, hv_computer)
-        if valid_preference_rewards.shape[0] == 0:
-            metrics[f"{prefix}/qed"] = float("nan")
-            metrics[f"{prefix}/sa"] = float("nan")
-        else:
-            preference_means = valid_preference_rewards.mean(dim=0)
-            metrics[f"{prefix}/qed"] = preference_means[0].item()
-            metrics[f"{prefix}/sa"] = preference_means[1].item()
-    return metrics
+    return n_hypervolume, full_hypervolume, valid_rewards, valids.float().mean().item()
 
 
 def main(config: Namespace) -> None:
-    if config.vol_samples <= 0 or config.samples_per_tradeoff <= 0:
-        raise ValueError("vol_samples and samples_per_tradeoff must be positive")
-    if config.vol_samples % config.samples_per_tradeoff != 0:
-        raise ValueError("vol_samples must be divisible by samples_per_tradeoff")
-    if config.n <= 0:
-        raise ValueError("n must be positive")
+    assert config.vol_samples > 0 and config.samples_per_tradeoff > 0, "vol_samples and samples_per_tradeoff must be positive"
+    assert config.vol_samples % config.samples_per_tradeoff == 0, "vol_samples must be divisible by samples_per_tradeoff"
+    assert config.n > 0, "n must be positive"
+    assert config.validate_2d == "none" or config.num_diversity_samples > 0, "num_diversity_samples must be positive when 2D validation is enabled"
 
     qed_folder = Path(config.qed_folder)
     sa_folder = Path(config.sa_folder)
@@ -227,6 +233,8 @@ def main(config: Namespace) -> None:
     checkpoint_pairs = resolve_checkpoint_pairs(qed_folder, sa_folder, config.epochs, config.evaluate_every_n_steps)
     num_tradeoffs = config.vol_samples // config.samples_per_tradeoff
     tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_tradeoffs, 2, config.seed)
+    num_diversity_tradeoffs = ceil(config.num_diversity_samples / config.samples_per_tradeoff) if config.validate_2d != "none" else 0
+    diversity_tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_diversity_tradeoffs, 2, config.seed + 1)
     config.tradeoffs = tradeoffs
     config.source_kl_weight = source_kl_weight
 
@@ -249,7 +257,28 @@ def main(config: Namespace) -> None:
         dir=str(run_resolution.run_dir),
     )
     epoch_metric = log.set_step_metric(checkpoint_pairs[0][0], "epoch")
-    log.run.define_metric("blend/*", step_metric="epoch")
+
+    n_hv = log.watch("n_hypervolume", "epoch")
+    full_hv = log.watch("full_hypervolume", "epoch")
+    qed = log.watch("qed", "epoch")
+    qed_td = log.watch("top_decile/qed", "epoch")
+    qed_t3 = log.watch("top_3/qed", "epoch")
+    sa = log.watch("sa", "epoch")
+    sa_td = log.watch("top_decile/sa", "epoch")
+    sa_t3 = log.watch("top_3/sa", "epoch")
+    valid_frac = log.watch("valid_fraction", "epoch")
+
+    # if config.validate_2d != "none":
+    #     valid_2d = log.watch("diversity/validity_2d", "epoch")
+    #     diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    #     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    #     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
+
+    # if config.validate_3d != "none":
+    #     valid_3d = log.watch("diversity/validity_3d", "epoch")
+    #     diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
+    #     vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
+    #     auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
 
     seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,7 +299,7 @@ def main(config: Namespace) -> None:
         with timer.section("load_state"):
             load_model_state(qed_model, qed_path, device)
             load_model_state(sa_model, sa_path, device)
-        with timer.section("evaluate"):
+        with timer.section("evaluate_hypervolume"):
             reward_results = sample_rewards(
                 env=env,
                 reward=reward,
@@ -280,8 +309,41 @@ def main(config: Namespace) -> None:
                 batch_size=config.batch_size,
                 fixed_atoms=config.fixed_A,
             )
-            metrics = evaluate_reward_results(reward_results, hv_computer, group_size=config.n, shuffle_seed=config.seed)
-        log.log_dict(metrics, "epoch")
+            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate_reward_results(reward_results, hv_computer, group_size=config.n, shuffle_seed=config.seed)
+            (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
+
+        # if config.validate_2d != "none":
+        #     with timer.section("evaluate_diversity"):
+        #         samples_diversity = sample_x(
+        #             env=env,
+        #             tradeoffs=diversity_tradeoffs,
+        #             samples_per_tradeoff=config.samples_per_tradeoff,
+        #             num_samples=config.num_diversity_samples,
+        #             discretization_steps=config.num_integration_steps,
+        #             batch_size=config.batch_size,
+        #             fixed_atoms=config.fixed_A,
+        #         )
+        #         sample = DDGraph.collate([sample.sample for sample in samples_diversity])
+        #         mols = graph_to_mols(sample)
+        #         valid_2d_count, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(mols)
+        #         valid_2d.val = valid_2d_count / len(mols)
+
+        # if config.validate_3d != "none":
+        #     with timer.section("evaluate_diversity_3d"):
+        #         samples_diversity = sample_x(
+        #             env=env,
+        #             tradeoffs=diversity_tradeoffs,
+        #             samples_per_tradeoff=config.samples_per_tradeoff,
+        #             num_samples=config.num_diversity_samples,
+        #             discretization_steps=config.num_integration_steps,
+        #             batch_size=config.batch_size,
+        #             fixed_atoms=config.fixed_A,
+        #         )
+        #         sample = Sample.concat(samples_diversity).sample
+        #         mols = graph_to_mols(sample)
+        #         full_bust = config.validate_3d == "full"
+        #         valid_3d_count, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(mols, full_bust=full_bust)
+        #         valid_3d.val = valid_3d_count / len(mols)
 
         print("\n=== Timing summary (by total time) ===")
         for name, count, total, mean, p50, p95 in timer.summary():
