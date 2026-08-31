@@ -116,7 +116,10 @@ def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -
 
 def evaluate(trainer: HVRL, samples: list[Sample], hv_computer: HVComputer, n: int) -> tuple[torch.Tensor, float, float, torch.Tensor, float]:
     samples_cat = Sample.concat(samples)
-    first_variation, info = trainer.hv_first_variation(samples_cat.sample, samples_cat.latent)
+    if trainer.scalarization == "sum":
+        first_variation, info = trainer.sum_scalarization(samples_cat.sample, samples_cat.latent)
+    else:
+        first_variation, info = trainer.hv_first_variation(samples_cat.sample, samples_cat.latent)
     valids = info["valids"].sum().item()
     rew = info["obj"].reshape(-1, trainer.reward.num_rew)
     rewards = [r for i, r in enumerate(rew) if info["valids"][i]]
