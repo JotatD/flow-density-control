@@ -7,7 +7,7 @@ import torch
 from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph
-from diffusiongym.molecules.flowmol import GEOMBaseModel
+from diffusiongym.molecules.flowmol import QM9BaseModel
 from diffusiongym.rewards import DummyReward, Reward
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
@@ -169,7 +169,7 @@ def main(config: Namespace) -> None:
         else:
             raise ValueError(f"Unknown reward: {config.reward}")
         
-        model = GEOMBaseModel(device=device)
+        model = QM9BaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.fixed_A > 0:
             unconstrained_sample = env.sample
