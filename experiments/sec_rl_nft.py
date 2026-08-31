@@ -7,7 +7,7 @@ import torch
 from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph
-from diffusiongym.molecules.flowmol import QM9BaseModel
+from diffusiongym.molecules.flowmol import QM9BaseModel, QM9BaseModel
 from diffusiongym.rewards import DummyReward, Reward
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
