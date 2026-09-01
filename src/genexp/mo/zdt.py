@@ -4,9 +4,21 @@ from typing import Any, Literal
 
 import torch
 
-from diffusiongym import DDTensor
+from diffusiongym import DDTensor, Reward
 
 from genexp.mo.base import MOReward
+
+
+class _ZDTReward(Reward[DDTensor]):
+    def __init__(self, zdt: "_ZDTTorch") -> None:
+        self.zdt = zdt
+
+    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        x_unit = self.zdt._unit_input(sample.data)
+        f1, f2 = self.zdt._evaluate_minimization(x_unit)
+        rewards = -torch.stack([f1, f2], dim=1)
+        valids = torch.ones(rewards.shape[0], device=rewards.device, dtype=torch.bool)
+        return rewards, {"valids": valids}
 
 
 class _ZDTTorch(MOReward[DDTensor]):
@@ -20,10 +32,12 @@ class _ZDTTorch(MOReward[DDTensor]):
         input_transform: Literal["clamp", "sigmoid", "none"] = "clamp",
         eps: float = 1e-8,
     ):
-        super().__init__(num_rew=2, ref_point=self.ref_point)
         self.input_dim = self.default_input_dim if input_dim is None else input_dim
+        if input_transform not in self.valid_input_transforms:
+            raise ValueError(f"input_transform must be one of {sorted(self.valid_input_transforms)}")
         self.input_transform = input_transform
         self.eps = eps
+        super().__init__(reward=_ZDTReward(self), num_rew=2, ref_point=self.ref_point)
 
     def _unit_input(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_transform == "clamp":
@@ -36,11 +50,6 @@ class _ZDTTorch(MOReward[DDTensor]):
 
     def _evaluate_minimization(self, x_unit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
-
-    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
-        x_unit = self._unit_input(sample.data)
-        f1, f2 = self._evaluate_minimization(x_unit)
-        return -torch.stack([f1, f2], dim=1), {}
 
 
 class ZDT1Torch(_ZDTTorch):
