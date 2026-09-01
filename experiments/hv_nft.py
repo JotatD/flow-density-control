@@ -9,12 +9,14 @@ from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph, QM9BaseModel
 from diffusiongym.molecules.flowmol import GEOMBaseModel
+from diffusiongym.molecules.rewards.utils import graph_to_mols
 from diffusiongym.rewards import DummyReward
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.mo_mol import TopologyMetrics
+from genexp.mo.moses import diversity_metrics_2d
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
     load_latest_training_checkpoint,
@@ -118,10 +120,11 @@ def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -
 
 
 
-def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float]:
+def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float, float, float, float]:
     first_variations = []
     objectives = []
     valid_masks = []
+    evaluated_samples = []
     num_valids = 0
     attempts: int = 0
     batch_size: int = trainer.config.batch_size
@@ -147,6 +150,7 @@ def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, m
             first_variations.append(first_variation[:batch])
             objectives.append(info["obj"][:batch])
             valid_masks.append(batch_valids[:batch])
+            evaluated_samples.extend(list(samples)[:batch])
             num_valids += int(batch_valids[:batch].sum().item())
             attempts += batch
     finally:
@@ -174,8 +178,11 @@ def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, m
         n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
     else: 
         n_hypervolume = 0.0
-        
-    return first_variation, n_hypervolume, full_hypervolume, reward_values, num_valids / attempts
+
+    mols = graph_to_mols(Sample.concat(evaluated_samples).sample)
+    _, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
+
+    return first_variation, n_hypervolume, full_hypervolume, reward_values, num_valids / attempts, diversity_tanimoto, vendi_tanimoto, auc_tanimoto
 
 
 def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], list[float]]:
@@ -264,6 +271,9 @@ def main(config: Namespace) -> None:
     # diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
     # vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
     # auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
+    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
     
     first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
     first_val_median = log.watch(f"{config.scalarization}_median", "epoch")
@@ -340,8 +350,25 @@ def main(config: Namespace) -> None:
         rows = timer.summary()
         
         if epoch.val % config.evaluate_every_n_steps == 0:
-            with timer.section("evaluate_hypervolume"):           
-                first_val_eval, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, vol_samples, hv_computer, n=config.n, max_retries=config.evaluate_max_retries, discretization_steps=config.num_integration_steps)
+            with timer.section("evaluate_hypervolume"):      
+                (
+                    first_val_eval,
+                    n_hv.val,
+                    full_hv.val,
+                    rewards,
+                    valid_frac.val,
+                    diversity_tanimoto.val,
+                    vendi_tanimoto.val,
+                    auc_tanimoto.val,
+                ) = evaluate(
+                    trainer,
+                    vol_samples,
+                    hv_computer,
+                    n=config.n,
+                    max_retries=config.evaluate_max_retries,
+                    discretization_steps=config.num_integration_steps,
+                )
+                
                 first_val_median.val = torch.median(first_val_eval).item()
                 first_val_mean.val = torch.mean(first_val_eval).item()
                 (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
