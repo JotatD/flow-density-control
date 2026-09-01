@@ -1,21 +1,23 @@
 import argparse
+import time
 from math import isfinite
 from pathlib import Path
-from omegaconf import OmegaConf
+
+import numpy as np
 import optuna
 import torch
-from genexp.mo import ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT6Torch
-from genexp.mo.utils import HVComputer
-from genexp.trainers.hv_diff import HVDiff
-from tqdm.auto import tqdm
-from diffusiongym.schedulers import DiffusionScheduler
-from genexp.base_models.mlp import TensorMLPModel
 from diffusiongym.environments import EpsilonEnvironment
-
-from genexp.wandb_log import WandbLogger
+from diffusiongym.schedulers import DiffusionScheduler
+from omegaconf import DictConfig, OmegaConf
+from tqdm.auto import tqdm
 from utils import seed_everything
-from genexp.mo.utils import plot_objective_points
-import numpy as np
+
+from genexp.base_models.mlp import TensorMLPModel
+from genexp.mo import ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT6Torch
+from genexp.mo.utils import HVComputer, plot_objective_points
+from genexp.trainers.hv_diff import HVDiff
+from genexp.wandb_log import WandbLogger
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -65,7 +67,7 @@ def evaluate_hypervolume(trainer, num_samples: int, hv_computer) -> tuple[float,
     rewards = []
     collected = 0
     old_discretization_steps = trainer.env.discretization_steps
-    trainer.env.discretization_steps = 1000
+    trainer.env.discretization_steps = 200
     
     with torch.no_grad():
         while collected < num_samples:
@@ -89,7 +91,7 @@ def evaluate_hypervolume(trainer, num_samples: int, hv_computer) -> tuple[float,
     
     return n_hypervolume, full_hypervolume, reward_values
 
-def main(config: OmegaConf) -> None:
+def main(config: DictConfig) -> None:
     problem_name = str(config.problem).lower()
     data_path = Path(f"assets/{problem_name}/data/obj.npy")
     ambient = torch.from_numpy(np.load(data_path)).float()
@@ -108,16 +110,16 @@ def main(config: OmegaConf) -> None:
     
     log = WandbLogger(
         project_name=config.project_name,
-        config=OmegaConf.to_container(config, resolve=True),
+        config=OmegaConf.to_container(config, resolve=True),  # ty: ignore[invalid-argument-type]
         use_wandb=config.wandb,
         run_name=config.run_name
     )
     
     md_step = log.set_step_metric(0, "md_step")
     global_step = log.set_step_metric(0, "global_step")
-    n_hv = log.watch('n_hypervolume', 'md_step')
-    full_hv = log.watch('full_hypervolume', 'md_step')
-    obj_img = log.set_image('objective_points', 'md_step')
+    n_hv = log.watch('n_hypervolume', 'global_step')
+    full_hv = log.watch('full_hypervolume', 'global_step')
+    obj_img = log.set_image('objective_points', 'global_step')
     
     hv_computer = HVComputer(ref_point=reward.ref_point.to(device), num_rew=reward.num_rew)
     
@@ -127,41 +129,35 @@ def main(config: OmegaConf) -> None:
     
     print(f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ", flush=True)
     loss = log.watch('loss', 'global_step')
-    try:
-        for _ in tqdm(range(config.num_md_iterations)):
-            md_step += 1
-            for am in range(config.adjoint_matching.num_iterations):
-                global_step += 1
-                am_dataset = trainer.generate_dataset()
-                loss.val = trainer.finetune(am_dataset, steps=None)
+    for _ in tqdm(range(config.num_md_iterations)):
+        md_step += 1
+        for am in range(config.adjoint_matching.num_iterations):
+            global_step += 1
+            am_dataset = trainer.generate_dataset()
+            loss.val = trainer.finetune(am_dataset, steps=None)
 
             n_hv.val, full_hv.val, reward_values = evaluate_hypervolume(trainer, num_samples=vol_samples, hv_computer=hv_computer)
             obj_img.val = plot_objective_points(ambient=ambient, special=reward_values)
-            
-            loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
-            print(
-                f"md={md_step} adjoint={am+1} "
-                f"loss={loss_text} "
-                f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ",
-                flush=True,
-            )
-            if loss_text == "nan" or not isfinite(n_hv.val) or not isfinite(full_hv.val):
-                raise ValueError("Encountered NaN or infinite values in loss or hypervolume metrics.")
-            trainer.update_base_model()
-    except Exception as e:
-        print(f"Error occurred during training: {e}", flush=True)
-    finally:
-        log.finish()
-        return full_hv.val
+        
+        loss_text = "nan" if not isfinite(loss.val) else f"{loss.val:.6f}"
+        print(
+            f"md={md_step} adjoint={am+1} "
+            f"loss={loss_text} "
+            f"n_hypervolume={n_hv.val:.6f} full_hypervolume={full_hv.val:.6f} ",
+            flush=True,
+        )
+        if loss_text == "nan" or not isfinite(n_hv.val) or not isfinite(full_hv.val):
+            raise ValueError("Encountered NaN or infinite values in loss or hypervolume metrics.")
+        trainer.update_base_model()
 
-def optuna_entry(trial):
+def optuna_entry():
     args = parse_args()
     config = {
         "seed": 5,
-        "n": trial.suggest_categorical("n", [4, 8, 16, 32, 64, 128]),
-        "num_md_iterations": 50,
-        "alpha_div": trial.suggest_float("alpha_div", 1e-4, 1e-2, log=True),
-        "lmbda": trial.suggest_float("lmbda", 1e2, 1e4, log=True),
+        "n": 4,
+        "num_md_iterations": 10,
+        "alpha_div": 1e-4,
+        "lmbda": 1e3,
         "temperature": 1e-5,
         "num_lambda": 4000,
         "num_p_nm1": 768,
@@ -171,32 +167,34 @@ def optuna_entry(trial):
             "num_iterations": 30,
             "batch_size": 64,
             "clip_grad_norm": 2.0,
-            "clip_loss": 1e5,
-            "lr": 0.001,
+            "clip_loss": -1,
+            "lr": 0.00001,
             "sampling": {
                 "num_samples": 64,
-                "num_integration_steps": 40
+                "num_integration_steps": 100
             }
         },
         "problem": args.problem,
         "wandb": args.wandb,
-        "project_name": trial.study.study_name,
-        "run_name": f"trial_{trial.number}"
+        "project_name": "reward_zdt1_study",
+        "run_name": f"{args.problem}_t:{time.strftime('%Y%m%d_%H%M%S')}",
     }
     config = OmegaConf.create(config)
     result = main(config)
     return result
 
 if __name__ == "__main__":
-    args = parse_args()
-    study = optuna.create_study(
-        study_name=args.name,
-        sampler=optuna.samplers.QMCSampler(seed=args.optuna_seed),
-        direction="maximize",
-        storage="sqlite:///optuna_store.db",
-        load_if_exists=True
-    )
+    # args = parse_args()
+    # study = optuna.create_study(
+    #     study_name=args.name,
+    #     sampler=optuna.samplers.QMCSampler(seed=args.optuna_seed),
+    #     direction="maximize",
+    #     storage="sqlite:///optuna_store.db",
+    #     load_if_exists=True
+    # )
 
-    study.optimize(optuna_entry, n_trials=32)
+    # study.optimize(optuna_entry, n_trials=32)
+    
+    optuna_entry()
 
     
