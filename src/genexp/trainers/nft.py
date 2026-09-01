@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from diffusiongym.base_models import BaseModel
 from diffusiongym.environments import Environment, Sample
 from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import FlowMolBaseModel
@@ -55,6 +56,32 @@ def subsample_steps(total_steps, percentage):
     steps_count = int(total_steps * percentage)
     samples = np.random.choice(np.arange(total_steps), size=steps_count, replace=False)
     return np.sort(samples)
+
+
+def endpoint_from_velocity(model: BaseModel[D], vt: D, xt: D, t: torch.Tensor) -> D:
+    """Recover the clean endpoint from an interpolant state and velocity."""
+    scheduler = model.scheduler
+    beta = scheduler.beta(xt, t)
+    beta_dot = scheduler.beta_dot(xt, t)
+    alpha = scheduler.alpha(xt, t)
+    alpha_dot = scheduler.alpha_dot(xt, t)
+    return (beta * vt - beta_dot * xt) / (alpha_dot * beta - alpha * beta_dot)
+
+
+def velocity(model: BaseModel[D], x: D, t: torch.Tensor, **kwargs) -> D:
+    """Convert an endpoint prediction to the corresponding interpolant velocity."""
+    output = model.forward(x, t, **kwargs)
+    scheduler = model.scheduler
+
+    if model.output_type == "endpoint":
+        alpha = scheduler.alpha(x, t)
+        beta = scheduler.beta(x, t)
+        beta_dot = scheduler.beta_dot(x, t)
+        alpha_dot = scheduler.alpha_dot(x, t)
+
+        return (beta_dot / beta) * x + (alpha_dot - alpha * beta_dot / beta) * output
+
+    raise ValueError(f"{model.output_type} not supported with naive_loss")
 
 
 def _mean_per_graph(values: torch.Tensor, batch_idxs: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -196,6 +223,7 @@ class DiffusionNFTrainer:
 
         self.mixing_beta: float = config.beta
         self.kl_weight: float = config.alpha
+        self.naive_loss: bool = getattr(config, "naive_loss", False)
         self.adaptive_loss_scaling: bool = getattr(config, "adaptive_loss_scaling", True)
         self.adaptive_scale_eps: float = getattr(config, "adaptive_scale_eps", 1e-5)
         # self.exploration_decay_type: int = config.exploration_decay_type
@@ -319,38 +347,79 @@ class DiffusionNFTrainer:
             step_kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
             prediction_kwargs = {**step_kwargs, "apply_softmax": False, "remove_com": False}
 
-            forward_endpoint = self.fine_model.forward(xt, t_batch, **prediction_kwargs)
+            if self.naive_loss:
+                forward_prediction = velocity(self.fine_model, xt, t_batch, **prediction_kwargs)
 
-            with torch.no_grad():
-                old_endpoint = self.exploration_model.forward(xt, t_batch, **prediction_kwargs)
-                ref_endpoint = self.base_model.forward(xt, t_batch, **prediction_kwargs)
+                with torch.no_grad():
+                    old_prediction = velocity(self.exploration_model, xt, t_batch, **prediction_kwargs)
+                    ref_forward_prediction = velocity(self.base_model, xt, t_batch, **prediction_kwargs)
 
-            positive_endpoint = self.mixing_beta * forward_endpoint + (1 - self.mixing_beta) * old_endpoint
-            raw_positive_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=positive_endpoint)
+                positive_v = self.mixing_beta * forward_prediction + (1 - self.mixing_beta) * old_prediction
+                positive_endpoint = endpoint_from_velocity(self.base_model, positive_v, xt, t_batch)
 
-            negative_endpoint = -self.mixing_beta * forward_endpoint + (1 + self.mixing_beta) * old_endpoint
-            raw_negative_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=negative_endpoint)
+                with torch.no_grad():
+                    positive_error_scale = (
+                        (positive_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
+                    )
 
-            positive_error_scale = torch.ones_like(raw_positive_loss)
-            negative_error_scale = torch.ones_like(raw_negative_loss)
-            if self.adaptive_loss_scaling:
-                positive_error_scale = flowmol_adaptive_error_scale(
-                    positive_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                positive_loss = ((positive_endpoint - clean_latent) ** 2).aggregate("mean") / positive_error_scale
+
+                negative_v = -self.mixing_beta * forward_prediction + (1 + self.mixing_beta) * old_prediction
+                negative_endpoint = endpoint_from_velocity(self.base_model, negative_v, xt, t_batch)
+                with torch.no_grad():
+                    negative_error_scale = (
+                        (negative_endpoint - clean_latent).apply(torch.abs).aggregate("mean").clip(min=0.0001)
+                    )
+
+                negative_loss = ((negative_endpoint - clean_latent) ** 2).aggregate("mean") / negative_error_scale
+
+                ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (
+                    negative_loss / self.mixing_beta
                 )
-                negative_error_scale = flowmol_adaptive_error_scale(
-                    negative_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                raw_ori_policy_loss = ori_policy_loss
+                policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
+
+                kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean()
+                old_kl_div = ((old_prediction - ref_forward_prediction) ** 2).aggregate("mean").mean()
+                old_deviate = ((old_prediction - forward_prediction) ** 2).aggregate("mean")
+                old_deviate_max = ((old_prediction - forward_prediction) ** 2).aggregate("max").mean()
+            else:
+                forward_endpoint = self.fine_model.forward(xt, t_batch, **prediction_kwargs)
+
+                with torch.no_grad():
+                    old_endpoint = self.exploration_model.forward(xt, t_batch, **prediction_kwargs)
+                    ref_endpoint = self.base_model.forward(xt, t_batch, **prediction_kwargs)
+
+                positive_endpoint = self.mixing_beta * forward_endpoint + (1 - self.mixing_beta) * old_endpoint
+                raw_positive_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=positive_endpoint)
+
+                negative_endpoint = -self.mixing_beta * forward_endpoint + (1 + self.mixing_beta) * old_endpoint
+                raw_negative_loss = self.base_model.train_loss(clean_latent, xt=xt, t=t_batch, pred=negative_endpoint)
+
+                positive_error_scale = torch.ones_like(raw_positive_loss)
+                negative_error_scale = torch.ones_like(raw_negative_loss)
+                if self.adaptive_loss_scaling:
+                    positive_error_scale = flowmol_adaptive_error_scale(
+                        positive_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                    )
+                    negative_error_scale = flowmol_adaptive_error_scale(
+                        negative_endpoint, clean_latent, loss_weights, self.adaptive_scale_eps
+                    )
+                positive_loss = raw_positive_loss / positive_error_scale
+                negative_loss = raw_negative_loss / negative_error_scale
+
+                raw_ori_policy_loss = r * (raw_positive_loss / self.mixing_beta) + (1.0 - r) * (
+                    raw_negative_loss / self.mixing_beta
                 )
-            positive_loss = raw_positive_loss / positive_error_scale
-            negative_loss = raw_negative_loss / negative_error_scale
+                ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (
+                    negative_loss / self.mixing_beta
+                )
+                policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
 
-            raw_ori_policy_loss = r * (raw_positive_loss / self.mixing_beta) + (1.0 - r) * (
-                raw_negative_loss / self.mixing_beta
-            )
-            ori_policy_loss = r * (positive_loss / self.mixing_beta) + (1.0 - r) * (negative_loss / self.mixing_beta)
-            policy_loss = (ori_policy_loss * self.adv_clip_max).mean()
-
-            kl_div_loss = flowmol_reference_loss(forward_endpoint, ref_endpoint, loss_weights).mean()
-            old_deviate = flowmol_reference_loss(forward_endpoint, old_endpoint, loss_weights)
+                kl_div_loss = flowmol_reference_loss(forward_endpoint, ref_endpoint, loss_weights).mean()
+                old_kl_div = flowmol_reference_loss(old_endpoint, ref_endpoint, loss_weights).mean()
+                old_deviate = flowmol_reference_loss(forward_endpoint, old_endpoint, loss_weights)
+                old_deviate_max = old_deviate.max()
             loss = policy_loss + self.kl_weight * kl_div_loss
 
             timed_statistics["policy_loss"].append(policy_loss.item())
@@ -359,14 +428,12 @@ class DiffusionNFTrainer:
             timed_statistics["positive_error_scale"].append(positive_error_scale.mean().item())
             timed_statistics["negative_error_scale"].append(negative_error_scale.mean().item())
             timed_statistics["kl_div_loss"].append(kl_div_loss.item())
-            timed_statistics["old_kl_div"].append(
-                flowmol_reference_loss(old_endpoint, ref_endpoint, loss_weights).mean().item()
-            )
+            timed_statistics["old_kl_div"].append(old_kl_div.item())
             timed_statistics["total_loss"].append(loss.item())
             timed_statistics["x0_norm"].append((clean_latent**2).aggregate("mean").mean().item())
             timed_statistics["x0_norm_max"].append((clean_latent**2).aggregate("max").mean().item())
             timed_statistics["old_deviate"].append(old_deviate.mean().item())
-            timed_statistics["old_deviate_max"].append(old_deviate.max().item())
+            timed_statistics["old_deviate_max"].append(old_deviate_max.item())
 
             if loss.isnan():
                 self.optimizer.zero_grad()
