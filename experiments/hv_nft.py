@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     #logging
     parser.add_argument("--num-time-groups", type=int, default=2)    
     
+    parser.add_argument("--model", type=str, choices=["qm9", "geom"], default="qm9")
+    
     return parser.parse_args()
 
 def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
@@ -213,7 +215,7 @@ def main(config: Namespace) -> None:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
-        model = QM9BaseModel(device=device)
+        model = QM9BaseModel(device=device) if config.model == "qm9" else GEOMBaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.fixed_A > 0:
             unconstrained_sample = env.sample
