@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
-from diffusiongym.molecules import DDGraph
+from diffusiongym.molecules import DDGraph, QM9BaseModel
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.rewards import DummyReward
 from torch.utils.hipify.hipify_python import str2bool
@@ -57,19 +57,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_integration_steps", type=int, default=100)
 
     #every n step
-    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=1000)
-    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=1000)
+    parser.add_argument("--update_pretrained_every_n_steps", type=int, default=50)
+    parser.add_argument("--sample_nm1_every_n_steps", type=int, default=50)
     parser.add_argument("--resample_every_n_steps", type=int, default=1)
     
     parser.add_argument("--save_every_n_steps", type=int, default=10)
     
     #size
     parser.add_argument("--backward_batch_size", type=int, default=64)
-    parser.add_argument("--batch_size", type=int, default=320)
+    parser.add_argument("--batch_size", type=int, default=500)
     parser.add_argument("--num_samples", type=int, default=32)
     parser.add_argument("--advantage_group_size", type=int, default=32)
-    parser.add_argument("--num_p_nm1", type=int, default=60)
-    parser.add_argument("--vol_samples", type=int, default=64)
+    parser.add_argument("--num_p_nm1", type=int, default=85)
+    parser.add_argument("--vol_samples", type=int, default=1_000)
+    parser.add_argument("--evaluate_max_retries", type=int, default=10_000)
     parser.add_argument("--num_diversity_samples", type=int, default=128)
     parser.add_argument("--timestep_fraction", type=float, default=1.0)
 
@@ -114,15 +115,44 @@ def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -
 
 
 
-def evaluate(trainer: HVRL, samples: list[Sample], hv_computer: HVComputer, n: int) -> tuple[torch.Tensor, float, float, torch.Tensor, float]:
-    samples_cat = Sample.concat(samples)
-    if trainer.scalarization == "sum":
-        first_variation, info = trainer.sum_scalarization(samples_cat.sample, samples_cat.latent)
-    else:
-        first_variation, info = trainer.hv_first_variation(samples_cat.sample, samples_cat.latent)
-    valids = info["valids"].sum().item()
-    rew = info["obj"].reshape(-1, trainer.reward.num_rew)
-    rewards = [r for i, r in enumerate(rew) if info["valids"][i]]
+def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float]:
+    first_variations = []
+    objectives = []
+    valid_masks = []
+    num_valids = 0
+    attempts: int = 0
+    batch_size: int = trainer.config.batch_size
+
+    original_policy = trainer.env._policy
+    trainer.env.policy = trainer.fine_model
+    try:
+        while num_valids < vol_samples and attempts < max_retries:
+            print(f"num_valids={num_valids}, attempts={attempts}, remaining={vol_samples - num_valids}")
+            batch = min(batch_size, max_retries - attempts, (vol_samples - num_valids) * 5)
+            with torch.no_grad():
+                samples = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=True)
+            if trainer.scalarization == "sum":
+                first_variation, info = trainer.sum_scalarization(samples.sample, samples.latent)
+            else:
+                first_variation, info = trainer.hv_first_variation(samples.sample, samples.latent)
+
+            batch_valids = info["valids"]
+            remaining = vol_samples - num_valids
+            if batch_valids.sum().item() >= remaining:
+                batch = int(torch.nonzero(batch_valids, as_tuple=False)[remaining - 1].item()) + 1
+
+            first_variations.append(first_variation[:batch])
+            objectives.append(info["obj"][:batch])
+            valid_masks.append(batch_valids[:batch])
+            num_valids += int(batch_valids[:batch].sum().item())
+            attempts += batch
+    finally:
+        trainer.env._policy = original_policy
+
+    first_variation = torch.cat(first_variations, dim=0)
+    rew = torch.cat(objectives, dim=0).reshape(-1, trainer.reward.num_rew)
+    valid_mask = torch.cat(valid_masks, dim=0)
+    rewards = [r for i, r in enumerate(rew) if valid_mask[i]]
     
     num_rew = trainer.reward.num_rew
     ref_point = trainer.reward.ref_point
@@ -142,7 +172,7 @@ def evaluate(trainer: HVRL, samples: list[Sample], hv_computer: HVComputer, n: i
     else: 
         n_hypervolume = 0.0
         
-    return first_variation, n_hypervolume, full_hypervolume, reward_values, valids / len(samples)
+    return first_variation, n_hypervolume, full_hypervolume, reward_values, num_valids / attempts
 
 
 def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], list[float]]:
@@ -157,7 +187,6 @@ def main(config: Namespace) -> None:
     assert config.sample_nm1_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.resample_every_n_steps == 0
     assert config.update_pretrained_every_n_steps % config.sample_nm1_every_n_steps == 0
-    assert (not config.fulfill_num_samples and not config.only_valids) or (config.fulfill_num_samples and config.only_valids)
     timer = StepTimer(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     with timer.section("setup"):
         results_root = Path("output") / config.project_name
@@ -183,7 +212,7 @@ def main(config: Namespace) -> None:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
-        model = GEOMBaseModel(device=device)
+        model = QM9BaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.fixed_A > 0:
             unconstrained_sample = env.sample
@@ -240,8 +269,7 @@ def main(config: Namespace) -> None:
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
     # if epoch.val == -1:
-    #     samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-    #     first_val_eval.val, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, samples_eval, hv_computer, n=config.n)
+    #     first_val_eval.val, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, vol_samples, hv_computer, n=config.n, max_retries=config.evaluate_max_retries, discretization_steps=config.num_integration_steps)
     #     (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
     
     
@@ -310,8 +338,7 @@ def main(config: Namespace) -> None:
         
         if epoch.val % config.evaluate_every_n_steps == 0:
             with timer.section("evaluate_hypervolume"):           
-                samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-                first_val_eval, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, samples_eval, hv_computer, n=config.n)
+                first_val_eval, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, vol_samples, hv_computer, n=config.n, max_retries=config.evaluate_max_retries, discretization_steps=config.num_integration_steps)
                 first_val_median.val = torch.median(first_val_eval).item()
                 first_val_mean.val = torch.mean(first_val_eval).item()
                 (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
