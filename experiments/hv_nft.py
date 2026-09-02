@@ -1,4 +1,5 @@
 import argparse
+import pickle
 from argparse import Namespace
 from math import ceil
 from pathlib import Path
@@ -72,9 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, default=32)
     parser.add_argument("--advantage_group_size", type=int, default=32)
     parser.add_argument("--num_p_nm1", type=int, default=85)
-    parser.add_argument("--vol_samples", type=int, default=1_000)
+    parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--evaluate_max_retries", type=int, default=10_000)
-    parser.add_argument("--num_diversity_samples", type=int, default=128)
+    parser.add_argument("--num_diversity_samples", type=int, default=1_000)
     parser.add_argument("--timestep_fraction", type=float, default=1.0)
 
     parser.add_argument("--fulfill_num_samples", type=str2bool, default="n")
@@ -120,7 +121,7 @@ def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -
 
 
 
-def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float, float, float, float]:
+def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, checkpoint_dir: Path, epoch: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float, float, float, float]:
     first_variations = []
     objectives = []
     valid_masks = []
@@ -179,7 +180,10 @@ def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, m
     else: 
         n_hypervolume = 0.0
 
-    mols = graph_to_mols(Sample.concat(evaluated_samples).sample)
+    mols = list(graph_to_mols(Sample.concat(evaluated_samples).sample))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    with open(checkpoint_dir / f"mols_epoch_{epoch}.pkl", "wb") as f:
+        pickle.dump(mols, f)
     _, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
 
     return first_variation, n_hypervolume, full_hypervolume, reward_values, num_valids / attempts, diversity_tanimoto, vendi_tanimoto, auc_tanimoto
@@ -275,9 +279,26 @@ def main(config: Namespace) -> None:
     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
     
+    big_diversity_tanimoto = log.watch("big/diversity_tanimoto", "epoch")
+    big_vendi_tanimoto = log.watch("big/vendi_tanimoto", "epoch")
+    big_auc_tanimoto = log.watch("big/auc_coverage_tanimoto", "epoch")
+    big_valid_frac = log.watch("big/valid_fraction", "epoch")
+    big_n_hv = log.watch("big/n_hypervolume", "epoch")
+    big_full_hv = log.watch("big/full_hypervolume", "epoch")
+    big_qed = log.watch("big/qed", "epoch")
+    big_qed_td = log.watch("big/top_decile/qed_td", "epoch")
+    big_qed_t3 = log.watch("big/top_3/qed_t3", "epoch")
+    big_sa = log.watch("big/sa", "epoch")
+    big_sa_td = log.watch("big/top_decile/sa_td", "epoch")
+    big_sa_t3 = log.watch("big/top_3/sa_t3", "epoch")
+    
     first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
     first_val_median = log.watch(f"{config.scalarization}_median", "epoch")
     first_val_mean = log.watch(f"{config.scalarization}_mean", "epoch")
+    
+    big_first_val_median = log.watch(f"big/{config.scalarization}_median", "epoch")
+    big_first_val_mean = log.watch(f"big/{config.scalarization}_mean", "epoch")
+    
     fulfillment = log.watch("dataset/fulfillment", "epoch")
     hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
 
@@ -349,37 +370,65 @@ def main(config: Namespace) -> None:
                     
         rows = timer.summary()
         
-        if epoch.val % config.evaluate_every_n_steps == 0:
+        if epoch.val % config.evaluate_every_n_steps == 0 or epoch.val % config.evaluate_diversity_every_n_steps == 0:
             with timer.section("evaluate_hypervolume"):      
-                (
-                    first_val_eval,
-                    n_hv.val,
-                    full_hv.val,
-                    rewards,
-                    valid_frac.val,
-                    diversity_tanimoto.val,
-                    vendi_tanimoto.val,
-                    auc_tanimoto.val,
-                ) = evaluate(
+                res = evaluate(
                     trainer,
-                    vol_samples,
+                    config.num_diversity_samples if epoch.val % config.evaluate_diversity_every_n_steps == 0 else vol_samples,
                     hv_computer,
                     n=config.n,
+                    checkpoint_dir=run_resolution.run_dir / "checkpoints",
+                    epoch=epoch.val,
                     max_retries=config.evaluate_max_retries,
                     discretization_steps=config.num_integration_steps,
                 )
                 
-                first_val_median.val = torch.median(first_val_eval).item()
-                first_val_mean.val = torch.mean(first_val_eval).item()
-                (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-                
-                if valid_frac.val <= 0.0:
-                    zero_valid_count += 1
-                else:
-                    zero_valid_count = 0
+                if epoch.val % config.evaluate_diversity_every_n_steps == 0:
+                    (
+                        first_val_eval,
+                        big_n_hv.val,
+                        big_full_hv.val,
+                        rewards,
+                        big_valid_frac.val,
+                        big_diversity_tanimoto.val,
+                        big_vendi_tanimoto.val,
+                        big_auc_tanimoto.val,
+                    ) = res
                     
-                if zero_valid_count >= zero_valid_patience:
-                    break
+                    big_first_val_median.val = torch.median(first_val_eval).item()
+                    big_first_val_mean.val = torch.mean(first_val_eval).item()
+                    (big_qed.val, big_sa.val), (big_qed_td.val, big_sa_td.val), (big_qed_t3.val, big_sa_t3.val) = summarize_rewards(rewards)
+                    
+                    if big_valid_frac.val <= 0.0:
+                        zero_valid_count += 1
+                    else:
+                        zero_valid_count = 0
+                        
+                    if zero_valid_count >= zero_valid_patience:
+                        break
+                else:
+                    (
+                        first_val_eval,
+                        n_hv.val,
+                        full_hv.val,
+                        rewards,
+                        valid_frac.val,
+                        diversity_tanimoto.val,
+                        vendi_tanimoto.val,
+                        auc_tanimoto.val,
+                    ) = res
+                    
+                    first_val_median.val = torch.median(first_val_eval).item()
+                    first_val_mean.val = torch.mean(first_val_eval).item()
+                    (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
+                    
+                    if valid_frac.val <= 0.0:
+                        zero_valid_count += 1
+                    else:
+                        zero_valid_count = 0
+                        
+                    if zero_valid_count >= zero_valid_patience:
+                        break
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
