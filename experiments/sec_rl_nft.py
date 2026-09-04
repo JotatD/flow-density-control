@@ -7,13 +7,15 @@ import torch
 from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph
-from diffusiongym.molecules.flowmol import QM9BaseModel, QM9BaseModel
+from diffusiongym.molecules.flowmol import QM9BaseModel, GEOMBaseModel
+from diffusiongym.molecules.rewards.utils import graph_to_mols
 from diffusiongym.rewards import DummyReward, Reward
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.mo_mol import RDkitReward
+from genexp.mo.moses import diversity_metrics_2d
 from genexp.resume import (
     load_latest_training_checkpoint,
     mark_run_complete,
@@ -88,7 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--invalid_val", type=float, default=-1.0)
 
     #logging
-    parser.add_argument("--num-time-groups", type=int, default=2)    
+    parser.add_argument("--num-time-groups", type=int, default=2)  
+    parser.add_argument("--model", type=str, default="geom", choices=["geom", "flowmol"])  
     
     return parser.parse_args()
     
@@ -112,15 +115,17 @@ def sample_x(num_samples: int, trainer: DiffusionNFTrainer, discretization_steps
 
 
 
-def evaluate(samples: list[Sample], reward: Reward) -> tuple[torch.Tensor, float]:
+def evaluate(samples: list[Sample], reward: Reward) -> tuple[torch.Tensor, float, float, float, float]:
     samples_cat = Sample.concat(samples)
     rew, info = reward(samples_cat.sample, samples_cat.latent)
     valids = info["valids"].sum().item()
     rewards = [r for i, r in enumerate(rew) if info["valids"][i]]
 
     reward_values = torch.stack(rewards, dim=0)
+    mols = list(graph_to_mols(samples_cat.sample))
+    _, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
 
-    return reward_values, valids / len(samples)
+    return reward_values, valids / len(samples), diversity_tanimoto, vendi_tanimoto, auc_tanimoto
 
 
 def summarize_rewards(rewards: torch.Tensor) -> tuple[float, float, float]:
@@ -162,14 +167,14 @@ def main(config: Namespace) -> None:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         rew_cnf = {"valid_3d": config.validate_3d, "valid_2d": config.validate_2d, "invalid_val": config.invalid_val}
-        if config.reward == "sa":
-            reward = RDkitReward(rewards=["sa"], **rew_cnf)
-        elif config.reward == "qed":
-            reward = RDkitReward(rewards=["qed"], **rew_cnf)
-        else:
-            raise ValueError(f"Unknown reward: {config.reward}")
+        reward = RDkitReward(rewards=[config.reward], **rew_cnf)
         
-        model = QM9BaseModel(device=device)
+        if config.model == "geom":
+            model = GEOMBaseModel(device=device)
+        else:
+            model = QM9BaseModel(device=device)
+            
+        
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.fixed_A > 0:
             unconstrained_sample = env.sample
@@ -201,6 +206,9 @@ def main(config: Namespace) -> None:
     rew_std = log.watch(f"{config.reward}_std", "epoch")
 
     valid_frac = log.watch("valid_fraction", "epoch")
+    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
     # valid_3d = log.watch("diversity/validity_3d", "epoch")
     # diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
     # vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
@@ -278,7 +286,7 @@ def main(config: Namespace) -> None:
         if epoch.val % config.evaluate_every_n_steps == 0:
             with timer.section("evaluate_hypervolume"):
                 samples_eval = sample_x(vol_samples, trainer, discretization_steps=config.num_integration_steps)
-                rewards, valid_frac.val = evaluate(samples_eval, reward)
+                rewards, valid_frac.val, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = evaluate(samples_eval, reward)
                 rew_mean.val, rew_med.val, rew_std.val = summarize_rewards(rewards)
 
         print("\n=== Timing summary (by total time) ===")
