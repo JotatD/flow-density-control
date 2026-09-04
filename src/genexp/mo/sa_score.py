@@ -36,6 +36,10 @@ def readFragmentScores(name='fpscores'):
     # generate the full path filename:
     if name == "fpscores":
         name = op.join(op.dirname(__file__), name)
+        if not op.exists(f'{name}.pkl.gz'):
+            from rdkit.Contrib.SA_Score import sascorer
+
+            name = op.join(op.dirname(sascorer.__file__), "fpscores")
     data = pickle.load(gzip.open('%s.pkl.gz' % name))
     outDict = {}
     for i in data:

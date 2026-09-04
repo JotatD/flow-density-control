@@ -12,6 +12,16 @@ from genexp.mo.base import MOReward
 from genexp.mo.sa_score import calculateScore
 
 
+def _remove_hydrogens(rdmol: Chem.Mol) -> Chem.Mol:
+    """Return the conventional heavy-atom representation when possible."""
+    try:
+        return Chem.RemoveHs(rdmol)
+    except Exception:
+        # Generated invalid molecules should be rejected by the existing
+        # validity filters rather than crashing the whole reward batch here.
+        return rdmol
+
+
 class TopologyMetrics(MOReward[DDGraph]):
     def __init__(self, valid_2d: str = "none", valid_3d: str = "none", invalid_val: float = 0.0) -> None:
         RDLogger.DisableLog("rdApp.*")
@@ -33,10 +43,11 @@ class TopologyMetrics(MOReward[DDGraph]):
 
     @staticmethod
     def calculate_qed(rdmol):
-        return QED.qed(rdmol)
+        return QED.qed(_remove_hydrogens(rdmol))
 
     @staticmethod
     def calculate_sa(rdmol):
+        rdmol = _remove_hydrogens(rdmol)
         sa = calculateScore(rdmol)
         sa_n = (10 - sa) / 9
         return sa_n
@@ -44,6 +55,10 @@ class TopologyMetrics(MOReward[DDGraph]):
 
     def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         mols = graph_to_mols(sample)
+        # is_valid mutates its input, including its implicit-H settings. Keep the
+        # explicit-H molecules for validation and separate heavy-atom copies for
+        # QED/SA scoring.
+        score_mols = [_remove_hydrogens(Chem.Mol(mol)) for mol in mols]
         valid_mols: list[Chem.Mol] = []
         valid_indices: list[int] = []
 
@@ -66,7 +81,7 @@ class TopologyMetrics(MOReward[DDGraph]):
         valid_indices = [idx for idx, is_valid in zip(valid_indices, posebuster_valids) if is_valid]
 
         for idx in valid_indices:
-            mol = mols[idx]
+            mol = score_mols[idx]
             rewards[idx, 0] = float(self.calculate_qed(mol))
             rewards[idx, 1] = float(self.calculate_sa(mol))
             valids[idx] = True
