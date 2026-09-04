@@ -45,15 +45,20 @@ class MolecularMetrics(MOReward[DDGraph]):
 
     @staticmethod
     def calculate_qed(rdmol):
-        return QED.qed(rdmol)
+        return QED.qed(_remove_hydrogens(rdmol))
 
     @staticmethod
     def calculate_sa(rdmol):
+        rdmol = _remove_hydrogens(rdmol)
         sa = calculateScore(rdmol)
         return (10 - sa) / 9
 
     def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         mols = graph_to_mols(sample)
+        # is_valid mutates its input, including its implicit-H settings. Keep the
+        # explicit-H molecules for validation/3D scoring and separate heavy-atom
+        # copies for QED/SA scoring.
+        score_mols = [_remove_hydrogens(Chem.Mol(mol)) for mol in mols]
         valid_mols: list[Chem.Mol] = []
         valid_indices: list[int] = []
 
@@ -83,7 +88,7 @@ class MolecularMetrics(MOReward[DDGraph]):
         for idx, result in zip(valid_indices, xtb_results):
             if result is None:
                 continue
-            mol = mols[idx]
+            mol = score_mols[idx]
             rewards[idx, 0] = float(self.calculate_qed(mol))
             rewards[idx, 1] = float(self.calculate_sa(mol))
             rewards[idx, 2] = float(result.dipole_moment) / 20.0
@@ -180,10 +185,11 @@ class RDkitReward(MOReward[DDGraph]):
 
     @staticmethod
     def calculate_qed(rdmol):
-        return QED.qed(rdmol)
+        return QED.qed(_remove_hydrogens(rdmol))
 
     @staticmethod
     def calculate_sa(rdmol):
+        rdmol = _remove_hydrogens(rdmol)
         sa = calculateScore(rdmol)
         sa_n = (10 - sa) / 9
         return sa_n
@@ -201,6 +207,10 @@ class RDkitReward(MOReward[DDGraph]):
 
     def __call__(self, sample: DDGraph, latent: DDGraph, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
         mols = graph_to_mols(sample)
+        # is_valid mutates its input, including its implicit-H settings. Keep the
+        # explicit-H molecules for validation and separate heavy-atom copies for
+        # QED/SA scoring.
+        score_mols = [_remove_hydrogens(Chem.Mol(mol)) for mol in mols]
 
         valid_mols: list[Chem.Mol] = []
         valid_indices: list[int] = []
@@ -224,7 +234,7 @@ class RDkitReward(MOReward[DDGraph]):
         valid_indices = [idx for idx, is_valid in zip(valid_indices, posebuster_valids) if is_valid]
 
         for idx in valid_indices:
-            mol = mols[idx]
+            mol = score_mols[idx]
             rewards[idx] = self.evaluate_reward(mol)
             valids[idx] = True
 
