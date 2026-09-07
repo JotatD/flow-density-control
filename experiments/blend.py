@@ -1,21 +1,21 @@
 import argparse
 import json
 import math
+import pickle
 from argparse import Namespace
 from math import ceil
 from pathlib import Path
 
 import torch
-from diffusiongym import Sample
 from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.molecules.rewards.utils import graph_to_mols
+from rdkit import Chem
 from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.mo_mol import TopologyMetrics
 from genexp.mo.moses import diversity_metrics_2d
-# from genexp.mo.moses import diversity_metrics_3d
 from genexp.mo.utils import HVComputer
 from genexp.resume import mark_run_complete, resolve_run
 from genexp.trainers.diff_blend import BlendEnvironment
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     # logging
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--force_new_start", action="store_true")
-    parser.add_argument("--project_name", type=str, default="blend_2")
+    parser.add_argument("--project_name", type=str, default="blend_3")
     parser.add_argument("--run_name", type=str, default="diffusion_blend")
     parser.add_argument("--seed", type=int, default=5)
 
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=320)
     parser.add_argument("--vol_samples", type=int, default=320)
     parser.add_argument("--samples_per_tradeoff", type=int, default=8)
-    parser.add_argument("--num_diversity_samples", type=int, default=1000)
+    parser.add_argument("--num_diversity_samples", type=int, default=1000, help="Deprecated; diversity uses the reward-evaluation samples")
 
     # validity
     parser.add_argument("--validate_2d", type=str, default="none", choices=["none", "full"])
@@ -138,8 +138,9 @@ def sample_rewards(
     discretization_steps: int,
     batch_size: int,
     fixed_atoms: int,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[DDGraph]]:
     results = []
+    sampled_graphs = []
     sample_kwargs = {"n_atoms": fixed_atoms} if fixed_atoms > 0 else {}
     with torch.no_grad():
         for blend_vector in tradeoffs:
@@ -152,33 +153,10 @@ def sample_rewards(
                 batch_rewards, info = reward(samples.sample, samples.latent)
                 rewards.append(batch_rewards.detach().cpu())
                 valids.append(info["valids"].detach().cpu())
+                sampled_graphs.extend([sample.sample for sample in samples])
                 left -= batch
             results.append((torch.cat(rewards, dim=0), torch.cat(valids, dim=0)))
-    return results
-
-
-def sample_x(
-    env: BlendEnvironment,
-    tradeoffs: list[list[float]],
-    samples_per_tradeoff: int,
-    num_samples: int,
-    discretization_steps: int,
-    batch_size: int,
-    fixed_atoms: int,
-) -> list[Sample[DDGraph]]:
-    samples = []
-    sample_kwargs = {"n_atoms": fixed_atoms} if fixed_atoms > 0 else {}
-    with torch.no_grad():
-        for blend_vector in tradeoffs:
-            left = min(samples_per_tradeoff, num_samples - len(samples))
-            while left > 0:
-                batch = min(left, batch_size)
-                sampled = env.sample(batch, blend_vector=blend_vector, discretization_steps=discretization_steps, pbar=True, **sample_kwargs)
-                samples.extend([sample for sample in sampled])
-                left -= batch
-            if len(samples) == num_samples:
-                break
-    return samples
+    return results, sampled_graphs
 
 
 def compute_hypervolume(rewards: torch.Tensor, hv_computer: HVComputer) -> float:
@@ -200,10 +178,11 @@ def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], 
 
 def evaluate_reward_results(
     results: list[tuple[torch.Tensor, torch.Tensor]],
+    sampled_graphs: list[DDGraph],
     hv_computer: HVComputer,
     group_size: int,
     shuffle_seed: int,
-) -> tuple[float, float, torch.Tensor, float]:
+) -> tuple[float, float, torch.Tensor, float, float, float, float, float, list[Chem.Mol]]:
     rewards = torch.cat([preference_rewards for preference_rewards, _ in results], dim=0)
     valids = torch.cat([preference_valids for _, preference_valids in results], dim=0)
     valid_rewards = rewards[valids]
@@ -218,14 +197,17 @@ def evaluate_reward_results(
     else:
         n_hypervolume = 0.0
 
-    return n_hypervolume, full_hypervolume, valid_rewards, valids.float().mean().item()
+    mols = graph_to_mols(DDGraph.collate(sampled_graphs))
+    valid_2d_count, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
+    valid_2d_fraction = valid_2d_count / len(mols)
+
+    return n_hypervolume, full_hypervolume, valid_rewards, valids.float().mean().item(), valid_2d_fraction, diversity_tanimoto, vendi_tanimoto, auc_tanimoto, mols
 
 
 def main(config: Namespace) -> None:
     assert config.vol_samples > 0 and config.samples_per_tradeoff > 0, "vol_samples and samples_per_tradeoff must be positive"
     assert config.vol_samples % config.samples_per_tradeoff == 0, "vol_samples must be divisible by samples_per_tradeoff"
     assert config.n > 0, "n must be positive"
-    assert config.validate_2d == "none" or config.num_diversity_samples > 0, "num_diversity_samples must be positive when 2D validation is enabled"
 
     qed_folder = Path(config.qed_folder)
     sa_folder = Path(config.sa_folder)
@@ -233,8 +215,6 @@ def main(config: Namespace) -> None:
     checkpoint_pairs = resolve_checkpoint_pairs(qed_folder, sa_folder, config.epochs, config.evaluate_every_n_steps)
     num_tradeoffs = config.vol_samples // config.samples_per_tradeoff
     tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_tradeoffs, 2, config.seed)
-    num_diversity_tradeoffs = ceil(config.num_diversity_samples / config.samples_per_tradeoff) if config.validate_2d != "none" else 0
-    diversity_tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_diversity_tradeoffs, 2, config.seed + 1)
     config.tradeoffs = tradeoffs
     config.source_kl_weight = source_kl_weight
 
@@ -268,17 +248,10 @@ def main(config: Namespace) -> None:
     sa_t3 = log.watch("top_3/sa", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
 
-    # if config.validate_2d != "none":
-    #     valid_2d = log.watch("diversity/validity_2d", "epoch")
-    #     diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
-    #     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
-    #     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
-
-    # if config.validate_3d != "none":
-    #     valid_3d = log.watch("diversity/validity_3d", "epoch")
-    #     diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
-    #     vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
-    #     auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
+    valid_2d = log.watch("diversity/validity_2d", "epoch")
+    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
 
     seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -294,13 +267,15 @@ def main(config: Namespace) -> None:
     env = BlendEnvironment([qed_model, sa_model], discretization_steps=config.num_integration_steps, sampling_mode=config.sampling_mode)
 
     for checkpoint_epoch, qed_path, sa_path in tqdm(checkpoint_pairs, desc="Checkpoint epochs"):
+        if checkpoint_epoch == 0:
+            continue
         epoch_metric.val = checkpoint_epoch
         seed_everything(config.seed)
         with timer.section("load_state"):
             load_model_state(qed_model, qed_path, device)
             load_model_state(sa_model, sa_path, device)
         with timer.section("evaluate_hypervolume"):
-            reward_results = sample_rewards(
+            reward_results, reward_samples = sample_rewards(
                 env=env,
                 reward=reward,
                 tradeoffs=tradeoffs,
@@ -309,41 +284,12 @@ def main(config: Namespace) -> None:
                 batch_size=config.batch_size,
                 fixed_atoms=config.fixed_A,
             )
-            n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate_reward_results(reward_results, hv_computer, group_size=config.n, shuffle_seed=config.seed)
+            n_hv.val, full_hv.val, rewards, valid_frac.val, valid_2d.val, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val, mols = evaluate_reward_results(
+                reward_results, reward_samples, hv_computer, group_size=config.n, shuffle_seed=config.seed
+            )
             (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-
-        # if config.validate_2d != "none":
-        #     with timer.section("evaluate_diversity"):
-        #         samples_diversity = sample_x(
-        #             env=env,
-        #             tradeoffs=diversity_tradeoffs,
-        #             samples_per_tradeoff=config.samples_per_tradeoff,
-        #             num_samples=config.num_diversity_samples,
-        #             discretization_steps=config.num_integration_steps,
-        #             batch_size=config.batch_size,
-        #             fixed_atoms=config.fixed_A,
-        #         )
-        #         sample = DDGraph.collate([sample.sample for sample in samples_diversity])
-        #         mols = graph_to_mols(sample)
-        #         valid_2d_count, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(mols)
-        #         valid_2d.val = valid_2d_count / len(mols)
-
-        # if config.validate_3d != "none":
-        #     with timer.section("evaluate_diversity_3d"):
-        #         samples_diversity = sample_x(
-        #             env=env,
-        #             tradeoffs=diversity_tradeoffs,
-        #             samples_per_tradeoff=config.samples_per_tradeoff,
-        #             num_samples=config.num_diversity_samples,
-        #             discretization_steps=config.num_integration_steps,
-        #             batch_size=config.batch_size,
-        #             fixed_atoms=config.fixed_A,
-        #         )
-        #         sample = Sample.concat(samples_diversity).sample
-        #         mols = graph_to_mols(sample)
-        #         full_bust = config.validate_3d == "full"
-        #         valid_3d_count, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(mols, full_bust=full_bust)
-        #         valid_3d.val = valid_3d_count / len(mols)
+            with (run_resolution.run_dir / f"mols_epoch_{checkpoint_epoch}.pkl").open("wb") as file:
+                pickle.dump(mols, file)
 
         print("\n=== Timing summary (by total time) ===")
         for name, count, total, mean, p50, p95 in timer.summary():
