@@ -37,6 +37,7 @@ def readFragmentScores(name='fpscores'):
     if name == "fpscores":
         name = op.join(op.dirname(__file__), name)
         if not op.exists(f'{name}.pkl.gz'):
+            print("fpscores.pkl.gz not found, trying to create it...")
             from rdkit.Contrib.SA_Score import sascorer
 
             name = op.join(op.dirname(sascorer.__file__), "fpscores")
