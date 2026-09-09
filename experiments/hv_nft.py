@@ -1,17 +1,18 @@
 import argparse
 import pickle
 from argparse import Namespace
+from itertools import islice
 from math import ceil
 from pathlib import Path
 
 import numpy as np
 import torch
-from diffusiongym import Sample
 from diffusiongym.environments import EndpointEnvironment
 from diffusiongym.molecules import DDGraph, QM9BaseModel
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.molecules.rewards.utils import graph_to_mols
 from diffusiongym.rewards import DummyReward
+from rdkit import Chem
 from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
 from utils import seed_everything
@@ -101,31 +102,11 @@ def parse_args() -> argparse.Namespace:
     
     return parser.parse_args()
 
-def sample_x(num_samples: int, trainer: HVRL, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
-    left = num_samples
-    samples: list[Sample] = []
-
-    original_policy = trainer.env._policy
-    trainer.env.policy = trainer.fine_model
-    try:
-        with torch.no_grad():
-            while left > 0:
-                batch = min(left, trainer.config.batch_size)
-                sample = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=True)
-                samples.extend([s for s in sample])
-                left -= batch
-    finally:
-        trainer.env._policy = original_policy
-    
-    return samples
-
-
-
-def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, checkpoint_dir: Path, epoch: int, max_retries: int = 10_000, discretization_steps: int = 128) -> tuple[torch.Tensor, float, float, torch.Tensor, float, float, float, float]:
+def sample_x(trainer: HVRL, num_valids_requested: int, max_retries: int, discretization_steps: int = 128) -> tuple[list[Chem.Mol], torch.Tensor, torch.Tensor, torch.Tensor]:
     first_variations = []
     objectives = []
     valid_masks = []
-    evaluated_samples = []
+    sampled_graphs: list[DDGraph] = []
     num_valids = 0
     attempts: int = 0
     batch_size: int = trainer.config.batch_size
@@ -133,68 +114,82 @@ def evaluate(trainer: HVRL, vol_samples: int, hv_computer: HVComputer, n: int, c
     original_policy = trainer.env._policy
     trainer.env.policy = trainer.fine_model
     try:
-        while num_valids < vol_samples and attempts < max_retries:
-            print(f"num_valids={num_valids}, attempts={attempts}, remaining={vol_samples - num_valids}")
-            batch = min(batch_size, max_retries - attempts, (vol_samples - num_valids) * 5)
+        while num_valids < num_valids_requested and attempts < max_retries:
+            print(f"num_valids={num_valids}, attempts={attempts}, remaining={num_valids_requested - num_valids}")
+            batch = min(batch_size, max_retries - attempts, (num_valids_requested - num_valids) * 5)
+
+            #
             with torch.no_grad():
                 samples = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=True)
             if trainer.scalarization == "sum":
                 first_variation, info = trainer.sum_scalarization(samples.sample, samples.latent)
             else:
                 first_variation, info = trainer.hv_first_variation(samples.sample, samples.latent)
-
             batch_valids = info["valids"]
-            remaining = vol_samples - num_valids
+            remaining = num_valids_requested - num_valids
+
             if batch_valids.sum().item() >= remaining:
                 batch = int(torch.nonzero(batch_valids, as_tuple=False)[remaining - 1].item()) + 1
 
             first_variations.append(first_variation[:batch])
             objectives.append(info["obj"][:batch])
             valid_masks.append(batch_valids[:batch])
-            evaluated_samples.extend(list(samples)[:batch])
+            sampled_graphs.extend(sample.sample for sample in islice(samples, batch))
             num_valids += int(batch_valids[:batch].sum().item())
             attempts += batch
     finally:
         trainer.env._policy = original_policy
 
     first_variation = torch.cat(first_variations, dim=0)
-    rew = torch.cat(objectives, dim=0).reshape(-1, trainer.reward.num_rew)
+    rewards = torch.cat(objectives, dim=0).reshape(-1, trainer.reward.num_rew)
     valid_mask = torch.cat(valid_masks, dim=0)
-    rewards = [r for i, r in enumerate(rew) if valid_mask[i]]
-    
-    num_rew = trainer.reward.num_rew
-    ref_point = trainer.reward.ref_point
-        
-    if rewards:
-        reward_values = torch.stack(rewards, dim=0)
-        full_objectives = reward_values.reshape(1, -1, num_rew)
-        full_hypervolume = hv_computer(full_objectives).detach().cpu().item()
-    else:
-        reward_values = torch.zeros((1, num_rew), device=ref_point.device, dtype=torch.float32)
-        full_hypervolume = 0.0
-        
-    as_many = reward_values.shape[0] - (reward_values.shape[0] % n)
+    all_samples = list(graph_to_mols(DDGraph.collate(sampled_graphs)))
+
+    return all_samples, rewards, first_variation, valid_mask
+
+
+def evaluate(rewards: torch.Tensor, reward_names: list[str], hv_computer: HVComputer, n: int) -> dict[str, float]:
+    metrics = {
+        "n_hypervolume": 0.0,
+        "full_hypervolume": 0.0,
+    }
+    for reward_name in reward_names:
+        metrics.update({
+            reward_name: 0.0,
+            f"top_decile/{reward_name}_td": 0.0,
+            f"top_3/{reward_name}_t3": 0.0,
+            f"top_1/{reward_name}_t1": 0.0,
+        })
+    if rewards.shape[0] == 0:
+        return metrics
+
+    num_rew = rewards.shape[1]
+    full_objectives = rewards.reshape(1, -1, num_rew)
+    metrics["full_hypervolume"] = hv_computer(full_objectives).detach().cpu().item()
+
+    as_many = rewards.shape[0] - (rewards.shape[0] % n)
     if as_many > 0:
-        n_objectives = reward_values[:as_many].reshape(-1, n, num_rew)
-        n_hypervolume = hv_computer(n_objectives).mean().detach().cpu().item()
-    else: 
-        n_hypervolume = 0.0
+        n_objectives = rewards[:as_many].reshape(-1, n, num_rew)
+        metrics["n_hypervolume"] = hv_computer(n_objectives).mean().detach().cpu().item()
 
-    mols = list(graph_to_mols(Sample.concat(evaluated_samples).sample))
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    with open(checkpoint_dir / f"mols_epoch_{epoch}.pkl", "wb") as f:
-        pickle.dump(mols, f)
-    _, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
-
-    return first_variation, n_hypervolume, full_hypervolume, reward_values, num_valids / attempts, diversity_tanimoto, vendi_tanimoto, auc_tanimoto
-
-
-def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], list[float]]:
     top_decile_count = ceil(rewards.shape[0] * 0.1)
     means = rewards.mean(dim=0)
+    for reward_name, value in zip(reward_names, means.detach().cpu().tolist()):
+        metrics[reward_name] = value
+
     top_decile_means = rewards.topk(top_decile_count, dim=0).values.mean(dim=0)
+    for reward_name, value in zip(reward_names, top_decile_means.detach().cpu().tolist()):
+        metrics[f"top_decile/{reward_name}_td"] = value
+
     top_3_means = rewards.topk(min(3, rewards.shape[0]), dim=0).values.mean(dim=0)
-    return tuple(values.detach().cpu().numpy().tolist() for values in (means, top_decile_means, top_3_means))
+    for reward_name, value in zip(reward_names, top_3_means.detach().cpu().tolist()):
+        metrics[f"top_3/{reward_name}_t3"] = value
+
+    top_1 = rewards.topk(1, dim=0).values.squeeze(0)
+    for reward_name, value in zip(reward_names, top_1.detach().cpu().tolist()):
+        metrics[f"top_1/{reward_name}_t1"] = value
+
+    return metrics
 
 
 def main(config: Namespace) -> None:
@@ -250,81 +245,36 @@ def main(config: Namespace) -> None:
                 advantages = loop_state.get("advantages")
                 restore_rng_state(resume_checkpoint)
 
-    vol_samples = config.vol_samples
 
     epoch = log.set_step_metric(start_epoch, "epoch")
 
-    n_hv = log.watch("n_hypervolume", "epoch")
-    full_hv = log.watch("full_hypervolume", "epoch")
-    qed = log.watch("qed", "epoch")
-    qed_td = log.watch("top_decile/qed_td", "epoch")
-    qed_t3 = log.watch("top_3/qed_t3", "epoch")
-    sa = log.watch("sa", "epoch")
-    sa_td = log.watch("top_decile/sa_td", "epoch")
-    sa_t3 = log.watch("top_3/sa_t3", "epoch")
+    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
+    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
+    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
+
+    # diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
+    # vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
+    # auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
+    
     valid_frac = log.watch("valid_fraction", "epoch")
+    first_val_median = log.watch(f"{config.scalarization}_median", "epoch")
+    first_val_mean = log.watch(f"{config.scalarization}_mean", "epoch")
+    first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
+    fulfillment = log.watch("dataset/fulfillment", "epoch")
+    hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
     
     zero_valid_patience = 3
     zero_valid_count = 0
     
-    # valid_2d = log.watch("diversity/validity_2d", "epoch")
-    # valid_3d = log.watch("diversity/validity_3d", "epoch")
-    # diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
-    # vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
-    # auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
-    # diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
-    # vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
-    # auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
-    diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
-    vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
-    auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
-    
-    big_diversity_tanimoto = log.watch("big/diversity_tanimoto", "epoch")
-    big_vendi_tanimoto = log.watch("big/vendi_tanimoto", "epoch")
-    big_auc_tanimoto = log.watch("big/auc_coverage_tanimoto", "epoch")
-    big_valid_frac = log.watch("big/valid_fraction", "epoch")
-    big_n_hv = log.watch("big/n_hypervolume", "epoch")
-    big_full_hv = log.watch("big/full_hypervolume", "epoch")
-    big_qed = log.watch("big/qed", "epoch")
-    big_qed_td = log.watch("big/top_decile/qed_td", "epoch")
-    big_qed_t3 = log.watch("big/top_3/qed_t3", "epoch")
-    big_sa = log.watch("big/sa", "epoch")
-    big_sa_td = log.watch("big/top_decile/sa_td", "epoch")
-    big_sa_t3 = log.watch("big/top_3/sa_t3", "epoch")
-    
-    first_var = log.watch(f"dataset/{config.scalarization}", "epoch")
-    first_val_median = log.watch(f"{config.scalarization}_median", "epoch")
-    first_val_mean = log.watch(f"{config.scalarization}_mean", "epoch")
-    
-    big_first_val_median = log.watch(f"big/{config.scalarization}_median", "epoch")
-    big_first_val_mean = log.watch(f"big/{config.scalarization}_mean", "epoch")
-    
-    fulfillment = log.watch("dataset/fulfillment", "epoch")
-    hypervol_X_ = log.watch("bg/hypervolume_bg", "epoch")
+    obj_dir = run_resolution.run_dir / "objs"
+    scores_dir = run_resolution.run_dir / "scores"
+    ckpts_dir = run_resolution.run_dir / "ckpts"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    ckpts_dir.mkdir(parents=True, exist_ok=True)
 
-    # if epoch.val == -1:
-    #     first_val_eval.val, n_hv.val, full_hv.val, rewards, valid_frac.val = evaluate(trainer, vol_samples, hv_computer, n=config.n, max_retries=config.evaluate_max_retries, discretization_steps=config.num_integration_steps)
-    #     (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-    
-    
     for _ in tqdm(range(start_epoch, config.epochs)):
         epoch += 1
-        
-        # if epoch.val % config.evaluate_diversity_every_n_steps == 0:
-        #     with timer.section("evaluate_diversity"):
-        #         if config.validate_2d != "none" or config.validate_3d != "none":
-
-        #             samples_diversity = sample_x(config.num_diversity_samples, trainer, discretization_steps=config.num_integration_steps)
-        #             sample = Sample.concat(samples_diversity).sample
-        #             mols: list[Chem.Mol] = graph_to_mols(sample)
-
-        #             valid_2d_count, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(mols)
-        #             valid_2d.val = valid_2d_count / len(mols)
-
-        #             full_bust = (config.validate_3d == "full")
-        #             valid_3d_count, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(mols, full_bust=full_bust)
-        #             valid_3d.val = valid_3d_count / len(mols)
-
         if epoch.val % config.update_pretrained_every_n_steps == 0 and config.scalarization == "improvement":
             with timer.section("update_base_model"):
                 trainer.update_base_model()
@@ -342,7 +292,7 @@ def main(config: Namespace) -> None:
                 if dataset:
                     first_var.val = torch.median(fv).item()     
                        
-        if epoch.val % config.save_every_n_steps == 0:            
+        if epoch.val % config.save_every_n_steps == 0 and epoch.val > 0:
             with timer.section("save_checkpoint"):
                 save_training_checkpoint(
                     run_resolution.run_dir,
@@ -370,65 +320,41 @@ def main(config: Namespace) -> None:
                     
         rows = timer.summary()
         
-        if epoch.val % config.evaluate_every_n_steps == 0 or epoch.val % config.evaluate_diversity_every_n_steps == 0:
-            with timer.section("evaluate_hypervolume"):      
-                res = evaluate(
+        if epoch.val % config.evaluate_diversity_every_n_steps == 0:
+            with timer.section("evaluate_hypervolume"):
+                all_samples, rewards, first_val_eval, validity = sample_x(
                     trainer,
-                    config.num_diversity_samples if epoch.val % config.evaluate_diversity_every_n_steps == 0 else vol_samples,
-                    hv_computer,
-                    n=config.n,
-                    checkpoint_dir=run_resolution.run_dir / "checkpoints",
-                    epoch=epoch.val,
+                    config.num_diversity_samples,
                     max_retries=config.evaluate_max_retries,
                     discretization_steps=config.num_integration_steps,
                 )
+                with open(obj_dir / f"obj_{epoch.val}.pkl", "wb") as f:
+                    pickle.dump(all_samples, f)
+
+                first_val_median.val = torch.median(first_val_eval).item()
+                first_val_mean.val = torch.mean(first_val_eval).item()
+                valid_frac.val = validity.float().mean().item()
+
+                valid_rewards = rewards[validity]
+                score_metrics = evaluate(valid_rewards, reward.reward_names, hv_computer, n=config.n)
+                log.log_dict(score_metrics, "epoch")
+
+                validity_cpu = validity.detach().cpu()
+                clean_molecules = [mol for mol, valid in zip(all_samples, validity_cpu.tolist()) if valid]
+                np.savez(scores_dir / f"score_{epoch.val}.npz", scores=rewards.detach().cpu().numpy(), validity=validity_cpu.numpy())
+
+
+                _, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(clean_molecules)
                 
-                if epoch.val % config.evaluate_diversity_every_n_steps == 0:
-                    (
-                        first_val_eval,
-                        big_n_hv.val,
-                        big_full_hv.val,
-                        rewards,
-                        big_valid_frac.val,
-                        big_diversity_tanimoto.val,
-                        big_vendi_tanimoto.val,
-                        big_auc_tanimoto.val,
-                    ) = res
-                    
-                    big_first_val_median.val = torch.median(first_val_eval).item()
-                    big_first_val_mean.val = torch.mean(first_val_eval).item()
-                    (big_qed.val, big_sa.val), (big_qed_td.val, big_sa_td.val), (big_qed_t3.val, big_sa_t3.val) = summarize_rewards(rewards)
-                    
-                    if big_valid_frac.val <= 0.0:
-                        zero_valid_count += 1
-                    else:
-                        zero_valid_count = 0
-                        
-                    if zero_valid_count >= zero_valid_patience:
-                        break
+                torch.save(trainer.fine_model.state_dict(), ckpts_dir / f"ckpt_{epoch.val}.pt")
+
+                if valid_frac.val <= 0.0:
+                    zero_valid_count += 1
                 else:
-                    (
-                        first_val_eval,
-                        n_hv.val,
-                        full_hv.val,
-                        rewards,
-                        valid_frac.val,
-                        diversity_tanimoto.val,
-                        vendi_tanimoto.val,
-                        auc_tanimoto.val,
-                    ) = res
+                    zero_valid_count = 0
                     
-                    first_val_median.val = torch.median(first_val_eval).item()
-                    first_val_mean.val = torch.mean(first_val_eval).item()
-                    (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-                    
-                    if valid_frac.val <= 0.0:
-                        zero_valid_count += 1
-                    else:
-                        zero_valid_count = 0
-                        
-                    if zero_valid_count >= zero_valid_patience:
-                        break
+                if zero_valid_count >= zero_valid_patience:
+                    break
 
         print("\n=== Timing summary (by total time) ===")
         for name, cnt, total, mean, p50, p95 in rows:
