@@ -186,3 +186,4 @@ assets
 output
 logs
 *.db
+scripts
