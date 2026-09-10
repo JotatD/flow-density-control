@@ -4,6 +4,7 @@ from argparse import Namespace
 from itertools import islice
 from math import ceil
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 import torch
@@ -76,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_p_nm1", type=int, default=85)
     parser.add_argument("--vol_samples", type=int, default=128)
     parser.add_argument("--evaluate_max_retries", type=int, default=10_000)
+    parser.add_argument("--jackknife_permutations", type=int, default=100_000)
     parser.add_argument("--num_diversity_samples", type=int, default=1_000)
     parser.add_argument("--timestep_fraction", type=float, default=1.0)
 
@@ -146,6 +148,44 @@ def sample_x(trainer: HVRL, num_valids_requested: int, max_retries: int, discret
     all_samples = list(graph_to_mols(DDGraph.collate(sampled_graphs)))
 
     return all_samples, rewards, first_variation, valid_mask
+
+
+def jack_hv(scores: np.ndarray | torch.Tensor, hv_computer, n: int, permutations: int, ci: float) -> tuple[float, float, float, float]:
+    batch_size = scores.shape[0]
+    if n >= batch_size:
+        print("Warning: permutations must leave every score out at least once")
+        return 0.0, 0.0, 0.0, 0.0
+
+    sampled_indices = np.stack([
+        np.random.choice(batch_size, size=n, replace=False)
+        for _ in range(permutations)
+    ])
+    if isinstance(scores, torch.Tensor):
+        indices = torch.as_tensor(sampled_indices, device=scores.device)
+        sampled_scores = scores[indices]
+    else:
+        sampled_scores = scores[sampled_indices]
+    sampled_hvs = hv_computer(sampled_scores)
+    if isinstance(sampled_hvs, torch.Tensor):
+        sampled_hvs = sampled_hvs.detach().cpu().numpy()
+    sampled_hvs = np.asarray(sampled_hvs).reshape(-1)
+
+    included = np.zeros((permutations, batch_size), dtype=bool)
+    included[np.arange(permutations)[:, None], sampled_indices] = True
+    excluded = ~included
+    excluded_counts = excluded.sum(axis=0)
+    if np.any(excluded_counts == 0):
+        print("Warning: permutations must leave every score out at least once")
+        return 0.0, 0.0, 0.0, 0.0
+
+    leave_one_out = (excluded.T @ sampled_hvs) / excluded_counts
+    leave_one_out_mean = leave_one_out.mean()
+    variance = (batch_size - 1) / batch_size * np.square(leave_one_out - leave_one_out_mean).sum()
+
+    mean = sampled_hvs.mean()
+    z_score = NormalDist().inv_cdf((1.0 + ci) / 2.0)
+    margin = z_score * np.sqrt(variance)
+    return mean.item(), (mean - margin).item(), (mean + margin).item(), variance.item()
 
 
 def evaluate(rewards: torch.Tensor, reward_names: list[str], hv_computer: HVComputer, n: int) -> dict[str, float]:
@@ -337,6 +377,22 @@ def main(config: Namespace) -> None:
 
                 valid_rewards = rewards[validity]
                 score_metrics = evaluate(valid_rewards, reward.reward_names, hv_computer, n=config.n)
+                for jackknife_n in (100, 500):
+                    if valid_rewards.shape[0] > jackknife_n:
+                        with timer.section(f"jackknife_{jackknife_n}"):
+                            jack_mean, jack_low, jack_high, jack_variance = jack_hv(
+                                valid_rewards,
+                                hv_computer,
+                                n=jackknife_n,
+                                permutations=config.jackknife_permutations,
+                                ci=0.95,
+                            )
+                        score_metrics.update({
+                            f"jack/mean_{jackknife_n}": jack_mean,
+                            f"jack/low_{jackknife_n}": jack_low,
+                            f"jack/high_{jackknife_n}": jack_high,
+                            f"jack/var_{jackknife_n}": jack_variance,
+                        })
                 log.log_dict(score_metrics, "epoch")
 
                 validity_cpu = validity.detach().cpu()
