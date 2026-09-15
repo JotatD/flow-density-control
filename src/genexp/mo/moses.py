@@ -44,6 +44,9 @@ def diversity_metrics_2d(mols: list[Chem.Mol]) -> tuple[float, float, float, flo
 
 
 def diversity_metrics_3d(mols: list[Chem.Mol], full_bust: bool = False) -> tuple[float, float, float, float]:
+    if not mols:
+        return 0, 0.0, 0.0, 0.0
+
     buster = PoseBusters(config="mol" if full_bust else "mol_fast")
     busting = buster.bust(mols).all(axis=1).values  # ty: ignore[unresolved-attribute]
     conformer_valid_mols = [mol for mol, is_valid in zip(mols, busting) if is_valid]
