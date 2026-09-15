@@ -14,7 +14,7 @@ from diffusiongym.molecules.rewards.utils import graph_to_mols
 from tqdm.auto import tqdm
 from utils import seed_everything
 
-from genexp.mo.mo_mol import TopologyMetrics
+from genexp.mo.mo_mol import RDkitReward
 from genexp.mo.moses import diversity_metrics_2d
 from genexp.mo.utils import HVComputer
 from genexp.resume import mark_run_complete, resolve_run
@@ -56,8 +56,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate_3d", type=str, default="none", choices=["none", "fast", "full"])
 
     # reward-specific model runs
-    parser.add_argument("--qed_folder", type=str, default="output/qed/hv_nft_20260830_125045_050407")
-    parser.add_argument("--sa_folder", type=str, default="output/sa/hv_nft_20260830_141511_942475")
+    parser.add_argument("--qed_folder", type=str, default=None)
+    parser.add_argument("--sa_folder", type=str, default=None)
+    parser.add_argument("--dipole_folder", type=str, default=None)
 
     # molecule and reward modifiers
     parser.add_argument("--fixed_A", type=int, default=10)
@@ -96,31 +97,42 @@ def _read_run_configuration(folder: Path) -> dict:
     return manifest["configuration"]
 
 
-def validate_model_runs(qed_folder: Path, sa_folder: Path, fixed_atoms: int) -> float:
-    qed_config = _read_run_configuration(qed_folder)
-    sa_config = _read_run_configuration(sa_folder)
-    if qed_config.get("reward") != "qed":
-        raise ValueError(f"Expected a QED model run in {qed_folder}")
-    if sa_config.get("reward") != "sa":
-        raise ValueError(f"Expected an SA model run in {sa_folder}")
-    if not math.isclose(float(qed_config["alpha"]), float(sa_config["alpha"])):
-        raise ValueError("QED and SA models must use the same KL weight (alpha)")
-    # if int(qed_config["fixed_A"]) != int(sa_config["fixed_A"]) or int(qed_config["fixed_A"]) != fixed_atoms:
-    #     raise ValueError("QED and SA training runs and blend inference must use the same fixed_A")
-    return float(qed_config["alpha"])
+def configured_model_runs(config: Namespace) -> list[tuple[str, Path]]:
+    model_runs = [
+        (reward_name, Path(folder))
+        for reward_name, folder in (("qed", config.qed_folder), ("sa", config.sa_folder), ("dipole", config.dipole_folder))
+        if folder is not None
+    ]
+    if len(model_runs) not in {2, 3}:
+        raise ValueError("Provide model folders for exactly two or three of: qed, sa, dipole")
+    return model_runs
 
 
-def resolve_checkpoint_pairs(qed_folder: Path, sa_folder: Path, last_epoch: int, cadence: int) -> list[tuple[int, Path, Path]]:
+def validate_model_runs(model_runs: list[tuple[str, Path]]) -> float:
+    run_configs = []
+    for reward_name, folder in model_runs:
+        run_config = _read_run_configuration(folder)
+        if run_config.get("reward") != reward_name:
+            raise ValueError(f"Expected a {reward_name} model run in {folder}")
+        run_configs.append(run_config)
+
+    source_kl_weight = float(run_configs[0]["alpha"])
+    if any(not math.isclose(float(run_config["alpha"]), source_kl_weight) for run_config in run_configs[1:]):
+        raise ValueError("All reward models must use the same KL weight (alpha)")
+    return source_kl_weight
+
+
+def resolve_checkpoints(model_runs: list[tuple[str, Path]], last_epoch: int, cadence: int) -> list[tuple[int, list[Path]]]:
     if last_epoch < 0:
         raise ValueError("epochs must be nonnegative")
     if cadence <= 0:
         raise ValueError("evaluate_every_n_steps must be positive")
     epochs = list(range(0, last_epoch + 1, cadence))
-    pairs = [(epoch, qed_folder / f"model_epoch_{epoch}.pt", sa_folder / f"model_epoch_{epoch}.pt") for epoch in epochs]
-    missing = [str(path) for _, qed_path, sa_path in pairs for path in (qed_path, sa_path) if not path.is_file()]
+    checkpoints = [(epoch, [folder / f"model_epoch_{epoch}.pt" for _, folder in model_runs]) for epoch in epochs]
+    missing = [str(path) for _, paths in checkpoints for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing expected model checkpoints:\n" + "\n".join(missing))
-    return pairs
+    return checkpoints
 
 
 def load_model_state(model: GEOMBaseModel, path: Path, device: torch.device) -> None:
@@ -134,7 +146,7 @@ def load_model_state(model: GEOMBaseModel, path: Path, device: torch.device) -> 
 
 def sample_rewards(
     env: BlendEnvironment,
-    reward: TopologyMetrics,
+    reward: RDkitReward,
     tradeoffs: list[list[float]],
     samples_per_tradeoff: int,
     discretization_steps: int,
@@ -178,12 +190,13 @@ def main(config: Namespace) -> None:
     assert config.vol_samples % config.samples_per_tradeoff == 0, "vol_samples must be divisible by samples_per_tradeoff"
     assert config.n > 0, "n must be positive"
 
-    qed_folder = Path(config.qed_folder)
-    sa_folder = Path(config.sa_folder)
-    source_kl_weight = validate_model_runs(qed_folder, sa_folder, config.fixed_A)
-    checkpoint_pairs = resolve_checkpoint_pairs(qed_folder, sa_folder, config.epochs, config.evaluate_every_n_steps)
+    model_runs = configured_model_runs(config)
+    reward_names = [reward_name for reward_name, _ in model_runs]
+    source_kl_weight = validate_model_runs(model_runs)
+    checkpoints = resolve_checkpoints(model_runs, config.epochs, config.evaluate_every_n_steps)
     num_tradeoffs = config.vol_samples // config.samples_per_tradeoff
-    tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_tradeoffs, 2, config.seed)
+    tradeoffs = generate_tradeoffs(config.tradeoff_sampling, num_tradeoffs, len(model_runs), config.seed)
+    config.reward_names = reward_names
     config.tradeoffs = tradeoffs
     config.source_kl_weight = source_kl_weight
 
@@ -207,7 +220,7 @@ def main(config: Namespace) -> None:
         resume="allow",
         dir=str(run_resolution.run_dir),
     )
-    epoch_metric = log.set_step_metric(checkpoint_pairs[0][0], "epoch")
+    epoch_metric = log.set_step_metric(checkpoints[0][0], "epoch")
 
     valid_frac = log.watch("valid_fraction", "epoch")
 
@@ -224,23 +237,22 @@ def main(config: Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     timer = StepTimer(device=device)
     reward_config = {"valid_3d": config.validate_3d, "valid_2d": config.validate_2d, "invalid_val": config.invalid_val}
-    reward = TopologyMetrics(**reward_config)
+    reward = RDkitReward(reward_names, **reward_config)
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
 
-    qed_model = GEOMBaseModel(device=device)
-    sa_model = GEOMBaseModel(device=device)
-    qed_model.requires_grad_(False)
-    sa_model.requires_grad_(False)
-    env = BlendEnvironment([qed_model, sa_model], discretization_steps=config.num_integration_steps, sampling_mode=config.sampling_mode)
+    models = [GEOMBaseModel(device=device) for _ in model_runs]
+    for model in models:
+        model.requires_grad_(False)
+    env = BlendEnvironment(models, discretization_steps=config.num_integration_steps, sampling_mode=config.sampling_mode)
 
-    for checkpoint_epoch, qed_path, sa_path in tqdm(checkpoint_pairs, desc="Checkpoint epochs"):
+    for checkpoint_epoch, checkpoint_paths in tqdm(checkpoints, desc="Checkpoint epochs"):
         if checkpoint_epoch == 0:
             continue
         epoch_metric.val = checkpoint_epoch
         seed_everything(config.seed)
         with timer.section("load_state"):
-            load_model_state(qed_model, qed_path, device)
-            load_model_state(sa_model, sa_path, device)
+            for model, checkpoint_path in zip(models, checkpoint_paths, strict=True):
+                load_model_state(model, checkpoint_path, device)
         with timer.section("evaluate_hypervolume"):
             rewards, validity, reward_samples = sample_rewards(
                 env=env,

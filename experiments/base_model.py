@@ -12,7 +12,7 @@ from diffusiongym.molecules.rewards.utils import graph_to_mols
 from diffusiongym.rewards import DummyReward
 from utils import seed_everything
 
-from genexp.mo.mo_mol import TopologyMetrics
+from genexp.mo.mo_mol import RDkitReward
 from genexp.mo.moses import diversity_metrics_2d
 from genexp.mo.utils import HVComputer
 from genexp.resume import mark_run_complete, resolve_run
@@ -38,12 +38,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate_3d", choices=["none", "fast", "full"], default="none")
     parser.add_argument("--fixed_A", type=int, default=10)
     parser.add_argument("--invalid_val", type=float, default=-1.0)
+    parser.add_argument("--rewards", nargs="+", choices=["qed", "sa", "dipole"], default=["qed", "sa", "dipole"])
     return parser.parse_args()
 
 
 def sample_base_model(
     env: EndpointEnvironment,
-    reward: TopologyMetrics,
+    reward: RDkitReward,
     batch_size: int,
     num_valids_requested: int,
     max_attempts: int,
@@ -87,6 +88,8 @@ def main(config: argparse.Namespace) -> None:
     assert config.batch_size > 0, "batch_size must be positive"
     assert config.num_samples > 0, "num_samples must be positive"
     assert config.evaluate_max_retries > 0, "evaluate_max_retries must be positive"
+    if len(config.rewards) not in {2, 3} or len(set(config.rewards)) != len(config.rewards):
+        raise ValueError("rewards must contain two or three distinct objectives")
 
     config.model = "geom"
     config.epochs = 0
@@ -124,7 +127,7 @@ def main(config: argparse.Namespace) -> None:
     seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     timer = StepTimer(device=device)
-    reward = TopologyMetrics(valid_2d=config.validate_2d, valid_3d=config.validate_3d, invalid_val=config.invalid_val)
+    reward = RDkitReward(config.rewards, valid_2d=config.validate_2d, valid_3d=config.validate_3d, invalid_val=config.invalid_val)
     hv_computer = HVComputer(ref_point=reward.ref_point, num_rew=reward.num_rew)
     model = GEOMBaseModel(device=device)
     model.requires_grad_(False)
