@@ -13,7 +13,7 @@ from diffusiongym.rewards import DummyReward
 from utils import seed_everything
 
 from genexp.mo.mo_mol import RDkitReward
-from genexp.mo.moses import diversity_metrics_2d
+from genexp.mo.moses import diversity_metrics_2d, diversity_metrics_3d
 from genexp.mo.utils import HVComputer
 from genexp.resume import mark_run_complete, resolve_run
 from genexp.trainers.utils import StepTimer
@@ -118,6 +118,9 @@ def main(config: argparse.Namespace) -> None:
     diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
+    diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
+    vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
+    auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
 
     obj_dir = run_resolution.run_dir / "objs"
     scores_dir = run_resolution.run_dir / "scores"
@@ -173,6 +176,9 @@ def main(config: argparse.Namespace) -> None:
         valid_fraction.val = validity.float().mean().item()
         clean_molecules = [molecule for molecule, valid in zip(molecules, validity.tolist()) if valid]
         _, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(clean_molecules)
+        _, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(
+            clean_molecules, full_bust=config.validate_3d == "full"
+        )
 
         print("\n=== Timing summary (by total time) ===")
         for name, count, total, mean, p50, p95 in timer.summary():

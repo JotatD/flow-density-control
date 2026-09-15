@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 from utils import seed_everything
 
 from genexp.mo.mo_mol import MolecularMetrics, TopologyMetrics
-from genexp.mo.moses import diversity_metrics_2d
+from genexp.mo.moses import diversity_metrics_2d, diversity_metrics_3d
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
     load_latest_training_checkpoint,
@@ -292,9 +292,9 @@ def main(config: Namespace) -> None:
     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
 
-    # diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
-    # vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
-    # auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
+    diversity_usrcat = log.watch("diversity/diversity_usrcat", "epoch")
+    vendi_usrcat = log.watch("diversity/vendi_usrcat", "epoch")
+    auc_usrcat = log.watch("diversity/auc_coverage_usrcat", "epoch")
     
     valid_frac = log.watch("valid_fraction", "epoch")
     first_val_median = log.watch(f"{config.scalarization}_median", "epoch")
@@ -401,6 +401,9 @@ def main(config: Namespace) -> None:
 
 
                 _, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(clean_molecules)
+                _, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(
+                    clean_molecules, full_bust=config.validate_3d == "full"
+                )
                 
                 torch.save(trainer.fine_model.state_dict(), ckpts_dir / f"ckpt_{epoch.val}.pt")
 
