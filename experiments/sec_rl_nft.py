@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-time-groups", type=int, default=2)  
     parser.add_argument("--model", type=str, default="geom", choices=["geom", "flowmol"])  
     
+    parser.add_argument("--ckpt", type=str, default=None)
+    
     return parser.parse_args()
     
 def sample_x(num_samples: int, trainer: DiffusionNFTrainer, discretization_steps: int = 128) -> list[Sample[DDGraph]]:
@@ -173,6 +175,10 @@ def main(config: Namespace) -> None:
             model = GEOMBaseModel(device=device)
         else:
             model = QM9BaseModel(device=device)
+            
+        if config.ckpt is not None:
+            model.load_state_dict(torch.load(config.ckpt, map_location=device))
+            print(f"Loaded model checkpoint from {config.ckpt}")
             
         
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))

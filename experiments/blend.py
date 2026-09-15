@@ -3,14 +3,14 @@ import json
 import math
 import pickle
 from argparse import Namespace
-from math import ceil
+from itertools import islice
 from pathlib import Path
 
+import numpy as np
 import torch
 from diffusiongym.molecules import DDGraph
 from diffusiongym.molecules.flowmol import GEOMBaseModel
 from diffusiongym.molecules.rewards.utils import graph_to_mols
-from rdkit import Chem
 from tqdm.auto import tqdm
 from utils import seed_everything
 
@@ -21,6 +21,7 @@ from genexp.resume import mark_run_complete, resolve_run
 from genexp.trainers.diff_blend import BlendEnvironment
 from genexp.trainers.utils import StepTimer
 from genexp.wandb_log import WandbLogger
+from hv_nft import evaluate, jack_hv
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     # logging
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--force_new_start", action="store_true")
-    parser.add_argument("--project_name", type=str, default="blend_3")
+    parser.add_argument("--project_name", type=str, default="retro_compatibility")
     parser.add_argument("--run_name", type=str, default="diffusion_blend")
     parser.add_argument("--seed", type=int, default=5)
 
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=320)
     parser.add_argument("--vol_samples", type=int, default=320)
     parser.add_argument("--samples_per_tradeoff", type=int, default=8)
+    parser.add_argument("--jackknife_permutations", type=int, default=100_000)
     parser.add_argument("--num_diversity_samples", type=int, default=1000, help="Deprecated; diversity uses the reward-evaluation samples")
 
     # validity
@@ -103,8 +105,8 @@ def validate_model_runs(qed_folder: Path, sa_folder: Path, fixed_atoms: int) -> 
         raise ValueError(f"Expected an SA model run in {sa_folder}")
     if not math.isclose(float(qed_config["alpha"]), float(sa_config["alpha"])):
         raise ValueError("QED and SA models must use the same KL weight (alpha)")
-    if int(qed_config["fixed_A"]) != int(sa_config["fixed_A"]) or int(qed_config["fixed_A"]) != fixed_atoms:
-        raise ValueError("QED and SA training runs and blend inference must use the same fixed_A")
+    # if int(qed_config["fixed_A"]) != int(sa_config["fixed_A"]) or int(qed_config["fixed_A"]) != fixed_atoms:
+    #     raise ValueError("QED and SA training runs and blend inference must use the same fixed_A")
     return float(qed_config["alpha"])
 
 
@@ -138,70 +140,37 @@ def sample_rewards(
     discretization_steps: int,
     batch_size: int,
     fixed_atoms: int,
-) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[DDGraph]]:
-    results = []
+) -> tuple[torch.Tensor, torch.Tensor, list[DDGraph]]:
+    all_rewards = []
+    all_valids = []
     sampled_graphs = []
     sample_kwargs = {"n_atoms": fixed_atoms} if fixed_atoms > 0 else {}
     with torch.no_grad():
         for blend_vector in tradeoffs:
-            rewards = []
-            valids = []
-            left = samples_per_tradeoff
-            while left > 0:
-                batch = min(left, batch_size)
+            num_valids = 0
+            attempts = 0
+            max_attempts = 10 * samples_per_tradeoff
+            while num_valids < samples_per_tradeoff and attempts < max_attempts:
+                remaining = samples_per_tradeoff - num_valids
+                batch = min(batch_size, max_attempts - attempts, remaining * 5)
                 samples = env.sample(batch, blend_vector=blend_vector, discretization_steps=discretization_steps, pbar=True, **sample_kwargs)
                 batch_rewards, info = reward(samples.sample, samples.latent)
-                rewards.append(batch_rewards.detach().cpu())
-                valids.append(info["valids"].detach().cpu())
-                sampled_graphs.extend([sample.sample for sample in samples])
-                left -= batch
-            results.append((torch.cat(rewards, dim=0), torch.cat(valids, dim=0)))
-    return results, sampled_graphs
+                batch_rewards = batch_rewards.detach().cpu()
+                batch_valids = info["valids"].detach().cpu()
 
+                if batch_valids.sum().item() >= remaining:
+                    batch = int(torch.nonzero(batch_valids, as_tuple=False)[remaining - 1].item()) + 1
 
-def compute_hypervolume(rewards: torch.Tensor, hv_computer: HVComputer) -> float:
-    if rewards.shape[0] == 0:
-        return 0.0
-    return hv_computer(rewards.unsqueeze(0)).item()
+                all_rewards.append(batch_rewards[:batch])
+                all_valids.append(batch_valids[:batch])
+                sampled_graphs.extend(sample.sample for sample in islice(samples, batch))
+                num_valids += int(batch_valids[:batch].sum().item())
+                attempts += batch
 
+            if num_valids < samples_per_tradeoff:
+                print(f"Warning: tradeoff {blend_vector} produced {num_valids}/{samples_per_tradeoff} valid molecules after {attempts} attempts")
 
-def summarize_rewards(rewards: torch.Tensor) -> tuple[list[float], list[float], list[float]]:
-    if rewards.shape[0] == 0:
-        missing = [float("nan")] * rewards.shape[1]
-        return missing, missing.copy(), missing.copy()
-    top_decile_count = ceil(rewards.shape[0] * 0.1)
-    means = rewards.mean(dim=0)
-    top_decile_means = rewards.topk(top_decile_count, dim=0).values.mean(dim=0)
-    top_3_means = rewards.topk(min(3, rewards.shape[0]), dim=0).values.mean(dim=0)
-    return tuple(values.tolist() for values in (means, top_decile_means, top_3_means))
-
-
-def evaluate_reward_results(
-    results: list[tuple[torch.Tensor, torch.Tensor]],
-    sampled_graphs: list[DDGraph],
-    hv_computer: HVComputer,
-    group_size: int,
-    shuffle_seed: int,
-) -> tuple[float, float, torch.Tensor, float, float, float, float, float, list[Chem.Mol]]:
-    rewards = torch.cat([preference_rewards for preference_rewards, _ in results], dim=0)
-    valids = torch.cat([preference_valids for _, preference_valids in results], dim=0)
-    valid_rewards = rewards[valids]
-    full_hypervolume = compute_hypervolume(valid_rewards, hv_computer)
-
-    generator = torch.Generator(device="cpu").manual_seed(shuffle_seed)
-    shuffled_rewards = valid_rewards[torch.randperm(valid_rewards.shape[0], generator=generator)]
-    grouped_count = shuffled_rewards.shape[0] - shuffled_rewards.shape[0] % group_size
-    if grouped_count > 0:
-        grouped_rewards = shuffled_rewards[:grouped_count].reshape(-1, group_size, rewards.shape[1])
-        n_hypervolume = hv_computer(grouped_rewards).mean().item()
-    else:
-        n_hypervolume = 0.0
-
-    mols = graph_to_mols(DDGraph.collate(sampled_graphs))
-    valid_2d_count, diversity_tanimoto, vendi_tanimoto, auc_tanimoto = diversity_metrics_2d(mols)
-    valid_2d_fraction = valid_2d_count / len(mols)
-
-    return n_hypervolume, full_hypervolume, valid_rewards, valids.float().mean().item(), valid_2d_fraction, diversity_tanimoto, vendi_tanimoto, auc_tanimoto, mols
+    return torch.cat(all_rewards, dim=0), torch.cat(all_valids, dim=0), sampled_graphs
 
 
 def main(config: Namespace) -> None:
@@ -227,9 +196,11 @@ def main(config: Namespace) -> None:
     print(f"run_dir={run_resolution.run_dir}")
     print(f"sampling_mode={config.sampling_mode}")
     print(f"tradeoffs={tradeoffs}")
+    c_wandb = vars(config)
+    c_wandb.update({"scalarization": "blend_pp"})
     log = WandbLogger(
         project_name=config.project_name,
-        config=vars(config),
+        config=c_wandb,
         use_wandb=config.wandb,
         run_name=run_resolution.run_dir.name,
         id=run_resolution.wandb_run_id,
@@ -238,20 +209,16 @@ def main(config: Namespace) -> None:
     )
     epoch_metric = log.set_step_metric(checkpoint_pairs[0][0], "epoch")
 
-    n_hv = log.watch("n_hypervolume", "epoch")
-    full_hv = log.watch("full_hypervolume", "epoch")
-    qed = log.watch("qed", "epoch")
-    qed_td = log.watch("top_decile/qed", "epoch")
-    qed_t3 = log.watch("top_3/qed", "epoch")
-    sa = log.watch("sa", "epoch")
-    sa_td = log.watch("top_decile/sa", "epoch")
-    sa_t3 = log.watch("top_3/sa", "epoch")
     valid_frac = log.watch("valid_fraction", "epoch")
 
-    valid_2d = log.watch("diversity/validity_2d", "epoch")
     diversity_tanimoto = log.watch("diversity/diversity_tanimoto", "epoch")
     vendi_tanimoto = log.watch("diversity/vendi_tanimoto", "epoch")
     auc_tanimoto = log.watch("diversity/auc_coverage_tanimoto", "epoch")
+
+    obj_dir = run_resolution.run_dir / "objs"
+    scores_dir = run_resolution.run_dir / "scores"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    scores_dir.mkdir(parents=True, exist_ok=True)
 
     seed_everything(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,7 +242,7 @@ def main(config: Namespace) -> None:
             load_model_state(qed_model, qed_path, device)
             load_model_state(sa_model, sa_path, device)
         with timer.section("evaluate_hypervolume"):
-            reward_results, reward_samples = sample_rewards(
+            rewards, validity, reward_samples = sample_rewards(
                 env=env,
                 reward=reward,
                 tradeoffs=tradeoffs,
@@ -284,12 +251,34 @@ def main(config: Namespace) -> None:
                 batch_size=config.batch_size,
                 fixed_atoms=config.fixed_A,
             )
-            n_hv.val, full_hv.val, rewards, valid_frac.val, valid_2d.val, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val, mols = evaluate_reward_results(
-                reward_results, reward_samples, hv_computer, group_size=config.n, shuffle_seed=config.seed
-            )
-            (qed.val, sa.val), (qed_td.val, sa_td.val), (qed_t3.val, sa_t3.val) = summarize_rewards(rewards)
-            with (run_resolution.run_dir / f"mols_epoch_{checkpoint_epoch}.pkl").open("wb") as file:
+            mols = list(graph_to_mols(DDGraph.collate(reward_samples)))
+            with (obj_dir / f"obj_{checkpoint_epoch}.pkl").open("wb") as file:
                 pickle.dump(mols, file)
+
+            np.savez(scores_dir / f"score_{checkpoint_epoch}.npz", scores=rewards.numpy(), validity=validity.numpy())
+            valid_rewards = rewards[validity]
+            score_metrics = evaluate(valid_rewards, reward.reward_names, hv_computer, n=config.n)
+            for jackknife_n in (100, 500):
+                if valid_rewards.shape[0] > jackknife_n:
+                    with timer.section(f"jackknife_{jackknife_n}"):
+                        jack_mean, jack_low, jack_high, jack_variance = jack_hv(
+                            valid_rewards,
+                            hv_computer,
+                            n=jackknife_n,
+                            permutations=config.jackknife_permutations,
+                            ci=0.95,
+                        )
+                    score_metrics.update({
+                        f"jack/mean_{jackknife_n}": jack_mean,
+                        f"jack/low_{jackknife_n}": jack_low,
+                        f"jack/high_{jackknife_n}": jack_high,
+                        f"jack/var_{jackknife_n}": jack_variance,
+                    })
+            log.log_dict(score_metrics, "epoch")
+
+            valid_frac.val = validity.float().mean().item()
+            clean_molecules = [molecule for molecule, valid in zip(mols, validity.tolist()) if valid]
+            _, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(clean_molecules)
 
         print("\n=== Timing summary (by total time) ===")
         for name, count, total, mean, p50, p95 in timer.summary():
