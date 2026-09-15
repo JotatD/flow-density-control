@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
 
     #algorithm and problem
     parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
-    parser.add_argument("--reward", type=str, choices=["qed", "sa"], default="qed")
+    parser.add_argument("--reward", type=str, choices=["qed", "sa", "dipole"], default="qed")
     
     #hyper param
     parser.add_argument("--n", type=int, default=4)

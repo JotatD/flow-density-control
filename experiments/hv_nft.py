@@ -18,7 +18,7 @@ from torch.utils.hipify.hipify_python import str2bool
 from tqdm.auto import tqdm
 from utils import seed_everything
 
-from genexp.mo.mo_mol import TopologyMetrics
+from genexp.mo.mo_mol import MolecularMetrics, TopologyMetrics
 from genexp.mo.moses import diversity_metrics_2d
 from genexp.mo.utils import HVComputer
 from genexp.resume import (
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
 
     #algorithm and problem
     parser.add_argument("--scalarization", type=str, choices=["sum", "improvement"], default="improvement")
-    parser.add_argument("--reward", type=str, choices=["topology"], default="topology")
+    parser.add_argument("--reward", type=str, choices=["topology", "molecular"], default="topology")
     
     #hyper param
     parser.add_argument("--n", type=int, default=4)
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     
     #size
     parser.add_argument("--backward_batch_size", type=int, default=64)
-    parser.add_argument("--batch_size", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=320)
     parser.add_argument("--num_samples", type=int, default=32)
     parser.add_argument("--advantage_group_size", type=int, default=32)
     parser.add_argument("--num_p_nm1", type=int, default=85)
@@ -120,7 +120,6 @@ def sample_x(trainer: HVRL, num_valids_requested: int, max_retries: int, discret
             print(f"num_valids={num_valids}, attempts={attempts}, remaining={num_valids_requested - num_valids}")
             batch = min(batch_size, max_retries - attempts, (num_valids_requested - num_valids) * 5)
 
-            #
             with torch.no_grad():
                 samples = trainer.env.sample(batch, discretization_steps=discretization_steps, pbar=True)
             if trainer.scalarization == "sum":
@@ -257,10 +256,11 @@ def main(config: Namespace) -> None:
 
         seed_everything(int(config.seed))
 
-        print("problem=dxtb_10A")
+        print(f"problem={config.reward}")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        reward = TopologyMetrics(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
+        reward_cls = TopologyMetrics if config.reward == "topology" else MolecularMetrics
+        reward = reward_cls(valid_3d=config.validate_3d, valid_2d=config.validate_2d, invalid_val=config.invalid_val)
         model = QM9BaseModel(device=device) if config.model == "qm9" else GEOMBaseModel(device=device)
         env = EndpointEnvironment(model, DummyReward(), discretization_steps=int(config.num_integration_steps))
         if config.fixed_A > 0:
