@@ -220,6 +220,46 @@ losses = trainer.fit(num_iterations=10)
 
 Each iteration performs one **expand** step: adjoint matching driven by the score function of the current base model as the reward signal, which steers the fine-tuned model toward regions of higher density under the evolving reference. After each iteration the base model is updated to the fine-tuned model, implementing the mirror-descent update.
 
+## Red-kidney data and pretraining
+
+Run from the repository root in an environment with the project dependencies,
+PyTorch Lightning installed:
+
+```bash
+conda activate diff
+python scripts/generate_kidney_data.py
+python scripts/train_kidney_model.py --max_epochs 20
+```
+
+The generator writes 42,000 uniform red-kidney points to
+`assets/kidney/dec.npy` and their matching maximization objectives to
+`assets/kidney/obj.npy`. Only the filled red kidney is sampled;
+`metadata.json` records the seed and domain. Use `--num_samples`, `--output_dir`,
+and `--seed` to change generation.
+Generated assets are ignored by Git.
+
+Diffusion pretraining uses raw coordinates, rejects points outside the red kidney,
+and saves `assets/kidney/pretrained_diffusion.pth`. After training, it draws 2,000
+diffusion samples and saves `sampled_dec.npy` and `sampled_points.png` alongside
+the checkpoint. The plot shows the samples and the red kidney boundary without
+filtering generated points. Use `--num_samples` and `--sample_steps` to adjust sampling.
+To sample an existing checkpoint without retraining, run
+`python scripts/train_kidney_model.py --sample_only`.
+`genexp.mo.KidneyReward` returns the two positive maximization objectives:
+with `s = sin(pi*(y-1.08)/1.10)^3` and
+`q = 1/(1 + 0.35*max(0, (x-1.33)^2+(y-1.08)^2-0.55^2)^2)`,
+these are `q*(1+(1+s)^2)` and `q*(1+(1-s)^2)`. The reward remains differentiable
+outside the red kidney and uses a zero hypervolume reference point. Its `valids`
+mask is always true; objective evaluation does not enforce validity checks.
+
+Run `python experiments/hv_diff_kidney.py` to optimize the pretrained model with
+hypervolume-guided adjoint matching. Add `--config overrides.yaml` to override
+settings or `--wandb` for online logging. Each evaluation saves matching decision
+and objective samples, separate plots, and n-point/full-set hypervolume metrics
+under `output/kidney_<timestamp>/`; the fine-tuned checkpoint is saved after each
+outer iteration. Decision plots use `[-1.8, 4.15] × [-1.65, 1.65]`, and objective
+plots use `[0, 5] × [0, 5]`. Only bounds exceeded by plotted points expand.
+
 ## Citation
 
 If you use this code in your research, please include the following citations in your work:

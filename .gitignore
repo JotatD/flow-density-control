@@ -186,4 +186,8 @@ assets
 output
 logs
 *.db
-scripts
+scripts/*
+!scripts/generate_kidney_data.py
+!scripts/train_kidney_model.py
+!scripts/generate_triangle_data.py
+!scripts/train_triangle_model.py
