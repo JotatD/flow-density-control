@@ -103,6 +103,7 @@ def train_diffusion(
     ).to(device)
     _train_lightning_model(model, train_data, batch_size, max_epochs)
     torch.save(model.model.state_dict(), output_model_path)
+    return model
 
 
 if __name__ == "__main__":
