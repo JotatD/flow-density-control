@@ -20,11 +20,13 @@ except ImportError:
     peptide = []
     pass
 
-from genexp.mo.zdt import ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT4Torch, ZDT6Torch
+from genexp.mo.zdt import KidneyReward, TriangleReward, ZDT1Torch, ZDT2Torch, ZDT3Torch, ZDT4Torch, ZDT6Torch
 
 base = [
     "CombinedRewards",
     "MOReward",
+    "KidneyReward",
+    "TriangleReward",
     "ZDT1Torch",
     "ZDT2Torch",
     "ZDT3Torch",

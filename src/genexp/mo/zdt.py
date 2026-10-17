@@ -118,3 +118,45 @@ class ZDT6Torch(_ZDTTorch):
         g = 1.0 + 9.0 * ((x_unit[:, 1:] - 0.5) ** 2).mean(dim=1) / 0.25**0.25
         h = 1.0 - (f1 / g) ** 2
         return f1, g * h
+
+
+class _KidneyObjectives(Reward[DDTensor]):
+    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        x, y = sample.data.unbind(dim=1)
+        s = torch.sin(torch.pi * (y - 1.08) / 1.10).pow(3)
+        excess = ((x - 1.33).square() + (y - 1.08).square() - 0.55**2).clamp_min(0.0)
+        q = 1.0 / (1.0 + 0.35 * excess.square())
+        values = q.unsqueeze(1) * torch.stack([1.0 + (1.0 + s).square(), 1.0 + (1.0 - s).square()], dim=1)
+        valids = torch.ones(values.shape[0], device=values.device, dtype=torch.bool)
+        return values, {"valids": valids}
+
+
+class _TriangleObjectives(Reward[DDTensor]):
+    def __call__(self, sample: DDTensor, latent: DDTensor, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        x, y = sample.data.unbind(dim=1)
+        total = x + y
+        values = torch.stack([total, -(total - 1.0).square()], dim=1)
+        valids = torch.ones(values.shape[0], device=values.device, dtype=torch.bool)
+        return values, {"valids": valids}
+
+
+class TriangleReward(MOReward[DDTensor]):
+    """Maximize (x+y, -(x+y-1)^2) on raw coordinates without clipping.
+
+    The triangle x >= 0, y >= 0, x+y <= 1 restricts pretraining only.
+    The reference point lies below both objectives throughout that region.
+    """
+
+    def __init__(self):
+        super().__init__(reward=_TriangleObjectives(), num_rew=2, ref_point=torch.tensor([-0.1, -1.1]))
+
+
+class KidneyReward(MOReward[DDTensor]):
+    """Two maximization objectives on raw (x, y), without validity checks.
+
+    The smooth objective map is evaluated without clipping or a red-region penalty;
+    the red kidney restricts pretraining data only.
+    """
+
+    def __init__(self):
+        super().__init__(reward=_KidneyObjectives(), num_rew=2, ref_point=torch.zeros(2))

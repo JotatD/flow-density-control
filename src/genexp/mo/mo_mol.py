@@ -51,7 +51,10 @@ class RDkitReward(MOReward[DDGraph]):
 
     @staticmethod
     def calculate_qed(rdmol):
-        return QED.qed(rdmol)
+        try:
+            return QED.qed(rdmol)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def calculate_sa(rdmol):
