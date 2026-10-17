@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
 
     # algorithm
     parser.add_argument("--sampling_mode", type=str, required=True, choices=["full", "proba"])
-    parser.add_argument("--tradeoff_sampling", type=str, default="random", choices=["random", "sobol"])
+    parser.add_argument("--tradeoff_sampling", type=str, default="random", choices=["random", "sobol", "das_dennis"])
 
     # checkpoint cadence and integration
     parser.add_argument("--epochs", type=int, default=170)
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=320)
     parser.add_argument("--vol_samples", type=int, default=320)
     parser.add_argument("--samples_per_tradeoff", type=int, default=8)
+    parser.add_argument("--evaluation_samples", type=int, default=None, help="Randomly retain this many valid samples for reward and diversity metrics; raw outputs remain complete")
     parser.add_argument("--jackknife_permutations", type=int, default=100_000)
     parser.add_argument("--num_diversity_samples", type=int, default=1000, help="Deprecated; diversity uses the reward-evaluation samples")
 
@@ -82,10 +83,40 @@ def sobol_simplex_tradeoffs(num_samples: int, num_rews: int, seed: int) -> list[
     return torch.diff(boundaries, dim=1).tolist()
 
 
+def das_dennis_simplex_tradeoffs(num_samples: int, num_rews: int) -> list[list[float]]:
+    """Return a complete simplex lattice, requiring an exact lattice point count."""
+    if num_samples <= 0 or num_rews < 2:
+        raise ValueError("Das-Dennis requires positive num_samples and at least two rewards")
+    partitions = 1
+    while math.comb(partitions + num_rews - 1, num_rews - 1) < num_samples:
+        partitions += 1
+    count = math.comb(partitions + num_rews - 1, num_rews - 1)
+    if count != num_samples:
+        lower_count = math.comb(partitions + num_rews - 2, num_rews - 1) if partitions > 1 else 0
+        raise ValueError(
+            f"Das-Dennis cannot generate exactly {num_samples} weights for {num_rews} rewards. "
+            f"Choose vol_samples / samples_per_tradeoff equal to a complete lattice size "
+            f"(nearby sizes: {lower_count or count}, {count})."
+        )
+
+    def lattice(remaining: int, dimensions: int, prefix: list[float]):
+        if dimensions == 1:
+            yield prefix + [remaining / partitions]
+        else:
+            for value in range(remaining + 1):
+                yield from lattice(remaining - value, dimensions - 1, prefix + [value / partitions])
+
+    return list(lattice(partitions, num_rews, []))
+
+
 def generate_tradeoffs(sampling: str, num_samples: int, num_rews: int, seed: int) -> list[list[float]]:
     if sampling == "random":
         return uniform_simplex_tradeoffs(num_samples, num_rews, seed)
-    return sobol_simplex_tradeoffs(num_samples, num_rews, seed)
+    if sampling == "sobol":
+        return sobol_simplex_tradeoffs(num_samples, num_rews, seed)
+    if sampling == "das_dennis":
+        return das_dennis_simplex_tradeoffs(num_samples, num_rews)
+    raise ValueError(f"Unknown tradeoff sampling method: {sampling}")
 
 
 def _read_run_configuration(folder: Path) -> dict:
@@ -185,10 +216,26 @@ def sample_rewards(
     return torch.cat(all_rewards, dim=0), torch.cat(all_valids, dim=0), sampled_graphs
 
 
+def select_evaluation_indices(validity: torch.Tensor, num_samples: int | None, seed: int) -> torch.Tensor:
+    indices = torch.nonzero(validity, as_tuple=True)[0]
+    if num_samples is None:
+        return indices
+    if num_samples <= 0:
+        raise ValueError("evaluation_samples must be positive")
+    if len(indices) < num_samples:
+        print(f"Warning: only {len(indices)}/{num_samples} valid samples available for evaluation")
+        return indices
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    selected = torch.randperm(len(indices), generator=generator)[:num_samples]
+    return indices[selected].sort().values
+
+
 def main(config: Namespace) -> None:
     assert config.vol_samples > 0 and config.samples_per_tradeoff > 0, "vol_samples and samples_per_tradeoff must be positive"
     assert config.vol_samples % config.samples_per_tradeoff == 0, "vol_samples must be divisible by samples_per_tradeoff"
     assert config.n > 0, "n must be positive"
+    if config.evaluation_samples is not None and not 0 < config.evaluation_samples <= config.vol_samples:
+        raise ValueError("evaluation_samples must be positive and no greater than vol_samples")
 
     model_runs = configured_model_runs(config)
     reward_names = [reward_name for reward_name, _ in model_runs]
@@ -210,7 +257,7 @@ def main(config: Namespace) -> None:
     print(f"sampling_mode={config.sampling_mode}")
     print(f"tradeoffs={tradeoffs}")
     c_wandb = vars(config)
-    c_wandb.update({"scalarization": "blend_pp"})
+    c_wandb.update({"scalarization": "blend"})
     log = WandbLogger(
         project_name=config.project_name,
         config=c_wandb,
@@ -270,8 +317,14 @@ def main(config: Namespace) -> None:
             with (obj_dir / f"obj_{checkpoint_epoch}.pkl").open("wb") as file:
                 pickle.dump(mols, file)
 
-            np.savez(scores_dir / f"score_{checkpoint_epoch}.npz", scores=rewards.numpy(), validity=validity.numpy())
-            valid_rewards = rewards[validity]
+            evaluation_indices = select_evaluation_indices(validity, config.evaluation_samples, config.seed)
+            np.savez(
+                scores_dir / f"score_{checkpoint_epoch}.npz",
+                scores=rewards.numpy(),
+                validity=validity.numpy(),
+                evaluation_indices=evaluation_indices.numpy(),
+            )
+            valid_rewards = rewards[evaluation_indices]
             score_metrics = evaluate(valid_rewards, reward.reward_names, hv_computer, n=config.n)
             for jackknife_n in (100, 500):
                 if valid_rewards.shape[0] > jackknife_n:
@@ -292,7 +345,7 @@ def main(config: Namespace) -> None:
             log.log_dict(score_metrics, "epoch")
 
             valid_frac.val = validity.float().mean().item()
-            clean_molecules = [molecule for molecule, valid in zip(mols, validity.tolist()) if valid]
+            clean_molecules = [mols[index] for index in evaluation_indices.tolist()]
             _, diversity_tanimoto.val, vendi_tanimoto.val, auc_tanimoto.val = diversity_metrics_2d(clean_molecules)
             _, diversity_usrcat.val, vendi_usrcat.val, auc_usrcat.val = diversity_metrics_3d(
                 clean_molecules, full_bust=config.validate_3d == "full"
